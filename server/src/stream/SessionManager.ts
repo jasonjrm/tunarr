@@ -462,6 +462,11 @@ export class SessionManager {
           }
         }
 
+        // Register the viewer before starting, under the lock. HLS sessions are
+        // 'started' while they wait for their first segments; with no
+        // connection yet, a stale sweep in that window would end them.
+        session.addConnection(token, connection);
+
         if (!session.started || session.hasError) {
           await session.start();
           this.eventService.push({
@@ -484,7 +489,6 @@ export class SessionManager {
         throw session.error;
       }
 
-      session.addConnection(token, connection);
       this.eventService.push({
         type: 'stream',
         action: 'connection_add',

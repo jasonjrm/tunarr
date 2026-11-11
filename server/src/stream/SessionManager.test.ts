@@ -799,6 +799,34 @@ describe('session cap and stale-session sweep', () => {
     expect(manager.getHlsSession(chA)).toBe(a);
   });
 
+  it('a sweep during startup does not end the session being started', async () => {
+    vi.stubEnv('TUNARR_SESSION_STALENESS_MS', '20000');
+    vi.stubEnv('TUNARR_SESSION_CLEANUP_DELAY_SECONDS', '1');
+
+    // Like a real HLS session: 'started' at once, then a few seconds until
+    // the first segments exist.
+    class SlowReadySession extends StubHlsSession {
+      protected override async waitForStreamReady() {
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+        const { Result } = await import('@/types/result.js');
+        return Result.success(void 0);
+      }
+    }
+    const manager = makeMultiChannelManager(
+      (channel, options) => new SlowReadySession(channel, options),
+    );
+    manager.startStaleSessionSweep(500);
+
+    const pending = tune(manager, chA, 'a');
+    await vi.advanceTimersByTimeAsync(5_000);
+    const result = await pending;
+
+    expect(result.isSuccess()).toBe(true);
+    const session = result.get();
+    expect(session.stoppingOrStopped).toBe(false);
+    expect(manager.getHlsSession(chA)).toBe(session);
+  });
+
   it('the sweep cleans up an abandoned session without waiting for the cron', async () => {
     vi.stubEnv('TUNARR_SESSION_STALENESS_MS', '20000');
     vi.stubEnv('TUNARR_SESSION_CLEANUP_DELAY_SECONDS', '1');
