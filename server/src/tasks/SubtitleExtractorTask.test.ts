@@ -1,5 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MediaSourceId } from '../db/schema/base.ts';
+import { Result } from '../types/result.ts';
 import { SubtitleExtractorTask } from './SubtitleExtractorTask.ts';
 
 vi.mock('@/util/logging/LoggerFactory.js', () => {
@@ -32,6 +36,17 @@ vi.mock('../services/TvGuideService.ts', () => ({
 const mockFileExists = vi.fn<(p: string) => Promise<boolean>>();
 vi.mock('../util/fsUtil.ts', () => ({
   fileExists: (p: string) => mockFileExists(p),
+}));
+
+// Stands in for ffmpeg: each output path in the args gets what the test says
+// the track contains, then the run fails if the test asks it to.
+const mockFfmpeg = vi.fn<(args: string[]) => Promise<string>>();
+vi.mock('../util/ChildProcessHelper.ts', () => ({
+  ChildProcessHelper: class {
+    getStdout(_exe: string, args: string[]) {
+      return mockFfmpeg(args);
+    }
+  },
 }));
 
 const MEDIA_SOURCE_ID = 'media-source-1' as MediaSourceId;
@@ -82,6 +97,8 @@ function makeHarness(opts: {
   fillerMayPickSubtitles?: boolean;
   enableSubtitleExtraction?: boolean;
   downloadedPath?: string;
+  databaseDirectory?: string;
+  embeddedSubtitleIndexes?: number[];
 }) {
   const sourceType = opts.sourceType ?? 'jellyfin';
 
@@ -162,8 +179,22 @@ function makeHarness(opts: {
       Promise.resolve(opts.fillerMayPickSubtitles ?? false),
   );
 
+  const embeddedSubtitleIndexes = opts.embeddedSubtitleIndexes;
   const getStream = vi.fn(() =>
-    Promise.reject(new Error('should not be called')),
+    embeddedSubtitleIndexes
+      ? Promise.resolve(
+          Result.success({
+            streamSource: { type: 'file', path: '/media/show.mkv' },
+            streamDetails: {
+              subtitleDetails: embeddedSubtitleIndexes.map((index) => ({
+                type: 'embedded',
+                codec: 'ass',
+                index,
+              })),
+            },
+          }),
+        )
+      : Promise.reject(new Error('should not be called')),
   );
   const getFillerPrograms = vi.fn((_id: string) =>
     Promise.resolve([dbProgram]),
@@ -196,7 +227,9 @@ function makeHarness(opts: {
         enableSubtitleExtraction: opts.enableSubtitleExtraction ?? false,
       }),
     } as never,
-    { databaseDirectory: '/tmp/test-tunarr' } as never,
+    {
+      databaseDirectory: opts.databaseDirectory ?? '/tmp/test-tunarr',
+    } as never,
     {
       getProgramById: () => Promise.resolve(dbProgram),
       setSubtitlePath,
@@ -595,5 +628,147 @@ describe('SubtitleExtractorTask external subtitle top-up', () => {
     await run(harness);
 
     expect(harness.getStream).toHaveBeenCalledOnce();
+  });
+});
+
+describe('SubtitleExtractorTask embedded extraction', () => {
+  let dbDir: string;
+
+  beforeEach(async () => {
+    dbDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tunarr-subs-'));
+    // Startup creates the cache folders (bootstrap.ts).
+    await fs.mkdir(path.join(dbDir, 'cache', 'subtitles'), { recursive: true });
+    mockFileExists.mockReset();
+    mockFileExists.mockImplementation((p) =>
+      fs.access(p).then(
+        () => true,
+        () => false,
+      ),
+    );
+    mockFfmpeg.mockReset();
+  });
+
+  afterEach(async () => {
+    await fs.rm(dbDir, { recursive: true, force: true });
+  });
+
+  function extractionHarness() {
+    return makeHarness({
+      mayPickSubtitles: true,
+      enableSubtitleExtraction: true,
+      databaseDirectory: dbDir,
+      embeddedSubtitleIndexes: [2, 3],
+      subtitles: [],
+    });
+  }
+
+  // Output paths follow each `-c:s <codec>` pair in the ffmpeg args.
+  function outputPaths(args: string[]) {
+    return args.flatMap((arg, i) => (args[i - 2] === '-c:s' ? [arg] : []));
+  }
+
+  async function cachedFiles() {
+    const root = path.join(dbDir, 'cache', 'subtitles');
+    const entries = await fs
+      .readdir(root, { recursive: true, withFileTypes: true })
+      .catch(() => []);
+    return entries.filter((e) => e.isFile());
+  }
+
+  async function workFolderEntries() {
+    return fs
+      .readdir(path.join(dbDir, 'cache', 'subtitles-tmp'))
+      .catch(() => [] as string[]);
+  }
+
+  it('writes each track into the cache and leaves no work files behind', async () => {
+    mockFfmpeg.mockImplementation(async (args) => {
+      for (const out of outputPaths(args)) {
+        // Work files must never land in the OS temp dir.
+        expect(out.startsWith(path.join(dbDir, 'cache', 'subtitles-tmp'))).toBe(
+          true,
+        );
+        await fs.writeFile(out, 'Dialogue:\u0000 hi');
+      }
+      return '';
+    });
+
+    await run(extractionHarness());
+
+    const files = await cachedFiles();
+    expect(files).toHaveLength(2);
+    for (const file of files) {
+      const contents = await fs.readFile(
+        path.join(file.parentPath, file.name),
+        'utf8',
+      );
+      expect(contents).toBe('Dialogue: hi');
+    }
+    expect(await workFolderEntries()).toEqual([]);
+  });
+
+  it('removes partial output when ffmpeg fails and caches nothing', async () => {
+    mockFfmpeg.mockImplementation(async (args) => {
+      await fs.writeFile(outputPaths(args)[0]!, 'Dialogue: half');
+      throw new Error('ffmpeg timed out');
+    });
+
+    await run(extractionHarness());
+
+    expect(await cachedFiles()).toEqual([]);
+    expect(await workFolderEntries()).toEqual([]);
+  });
+
+  it('clears work folders orphaned by a crash at the start of a pass', async () => {
+    const orphan = path.join(dbDir, 'cache', 'subtitles-tmp', 'extract-old');
+    await fs.mkdir(orphan, { recursive: true });
+    await fs.writeFile(path.join(orphan, '2.raw.ass'), 'left over');
+    mockFfmpeg.mockResolvedValue('');
+
+    await run(extractionHarness());
+
+    expect(await workFolderEntries()).toEqual([]);
+  });
+
+  it('skips tracks already in the cache on the next pass', async () => {
+    mockFfmpeg.mockImplementation(async (args) => {
+      for (const out of outputPaths(args)) {
+        await fs.writeFile(out, 'Dialogue: hi');
+      }
+      return '';
+    });
+    const harness = extractionHarness();
+
+    await run(harness);
+    await run(harness);
+
+    expect(mockFfmpeg).toHaveBeenCalledOnce();
+  });
+
+  it('runs overlapping requests as one pass plus one follow-up', async () => {
+    mockFfmpeg.mockResolvedValue('');
+    const harness = extractionHarness();
+    let releaseFirst!: () => void;
+    const firstPassBlocked = new Promise<void>((r) => (releaseFirst = r));
+    const guides = await harness.getChannelGuides(undefined);
+    harness.getChannelGuides.mockReset();
+    harness.getChannelGuides
+      .mockImplementationOnce(async () => {
+        await firstPassBlocked;
+        return guides;
+      })
+      .mockResolvedValue(guides);
+
+    const first = harness.task.run({});
+    // Let the first pass reach the guide before the others arrive.
+    await vi.waitFor(() =>
+      expect(harness.getChannelGuides).toHaveBeenCalledOnce(),
+    );
+    const others = [1, 2, 3, 4].map(() => harness.task.run({}));
+    releaseFirst();
+    const results = await Promise.all([first, ...others]);
+
+    expect(results.every((r) => r.isSuccess())).toBe(true);
+    expect(harness.getChannelGuides).toHaveBeenCalledTimes(2);
   });
 });

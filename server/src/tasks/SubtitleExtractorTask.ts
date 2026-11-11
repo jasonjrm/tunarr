@@ -8,7 +8,6 @@ import fs from 'node:fs/promises';
 import path, { dirname, extname } from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { tmpName } from 'tmp-promise';
 import z from 'zod';
 import type { Lineup } from '../db/derived_types/Lineup.ts';
 import type { IChannelDB } from '../db/interfaces/IChannelDB.ts';
@@ -82,6 +81,11 @@ const defaultFilter = {
   durationMs: dayjs.duration({ hours: 1 }).asMilliseconds(),
 } satisfies DurationExtractionFilter;
 
+// Sibling of the subtitle cache, so a finished file is renamed into place on
+// the same filesystem. Never the OS temp dir: that is often RAM-backed, and an
+// anime track can be tens of MB.
+const ExtractionWorkFolderName = 'subtitles-tmp';
+
 @injectable()
 @taskDef({
   name: SubtitleExtractorTask.name,
@@ -97,6 +101,14 @@ export class SubtitleExtractorTask extends Task2<
   public ID = SubtitleExtractorTask.ID;
 
   schema = SubtitleExtractorTaskRequest;
+
+  // Every guide rebuild starts this task in the background, often several in
+  // a row. Passes that overlapped saw the same cache misses and extracted the
+  // same tracks again, so only one runs at a time. Requests that arrive during
+  // a pass share a single follow-up pass, which runs the newest request.
+  private static activePass: Promise<void> | undefined;
+  private static queuedPass: Promise<void> | undefined;
+  private static nextPass: (() => Promise<void>) | undefined;
 
   @InjectLogger() declare protected readonly logger: Logger;
 
@@ -126,7 +138,9 @@ export class SubtitleExtractorTask extends Task2<
     const filter = request.filter ?? defaultFilter;
     switch (filter.type) {
       case 'time':
-        await this.handleTimeFilter(filter);
+        await SubtitleExtractorTask.runOnePassAtATime(() =>
+          this.handleTimeFilter(filter),
+        );
         break;
       case 'channel':
       case 'program':
@@ -138,11 +152,42 @@ export class SubtitleExtractorTask extends Task2<
     }
   }
 
+  private static runOnePassAtATime(pass: () => Promise<void>): Promise<void> {
+    const start = (run: () => Promise<void>) => {
+      const active = run().finally(() => {
+        if (SubtitleExtractorTask.activePass === active) {
+          SubtitleExtractorTask.activePass = undefined;
+        }
+      });
+      SubtitleExtractorTask.activePass = active;
+      return active;
+    };
+
+    if (!SubtitleExtractorTask.activePass) {
+      return start(pass);
+    }
+
+    SubtitleExtractorTask.nextPass = pass;
+    SubtitleExtractorTask.queuedPass ??= SubtitleExtractorTask.activePass
+      .catch(() => {})
+      .then(() => {
+        const next = SubtitleExtractorTask.nextPass ?? pass;
+        SubtitleExtractorTask.queuedPass = undefined;
+        SubtitleExtractorTask.nextPass = undefined;
+        return start(next);
+      });
+    return SubtitleExtractorTask.queuedPass;
+  }
+
   private async handleTimeFilter(filter: DurationExtractionFilter) {
     const now = dayjs();
 
     // On the first run we may have to block if the guide is updating.
     await this.guideService.get();
+
+    // Only one pass runs at a time, so anything left in the work folder was
+    // orphaned by a crash or restart mid-extraction.
+    await this.clearExtractionWorkFolder();
 
     if (!(await this.profileResolver.anyProfileMayPickSubtitles())) {
       this.logger.trace(
@@ -471,7 +516,7 @@ export class SubtitleExtractorTask extends Task2<
       await fs.mkdir(cacheFolder);
     }
 
-    const subtitlesToSave = (
+    const pending = (
       await Promise.all(
         seq.collect(textBasedSubs, async (subtitle) => {
           if (isUndefined(subtitle.index)) {
@@ -489,11 +534,7 @@ export class SubtitleExtractorTask extends Task2<
           }
 
           if (!(await fileExists(fullPath))) {
-            return {
-              subtitle,
-              outPath: fullPath,
-              tmpPath: await tmpName({ postfix: extname(fullPath) }),
-            };
+            return { subtitle, index: subtitle.index, outPath: fullPath };
           }
           this.logger.trace(
             'Skipping existing subtitle extraction (stream index = %d) path for program %s (%s). File already exists: %s',
@@ -507,26 +548,7 @@ export class SubtitleExtractorTask extends Task2<
       )
     ).filter(isDefined);
 
-    for (const { outPath } of subtitlesToSave) {
-      const outDir = dirname(outPath);
-      if (!(await fileExists(outDir))) {
-        await fs.mkdir(outDir, { recursive: true });
-      }
-    }
-
-    const subtitleOutputArgs = subtitlesToSave.reduce((prev, curr) => {
-      const codec = curr.subtitle.codec === 'mov_text' ? 'text' : 'copy';
-      prev.push(
-        '-map',
-        `0:${curr.subtitle.index}`,
-        '-c:s',
-        codec,
-        `${curr.tmpPath}`,
-      );
-      return prev;
-    }, [] as string[]);
-
-    if (subtitlesToSave.length === 0) {
+    if (pending.length === 0) {
       this.logger.trace(
         'No subtitles to extract for program ID = %s',
         dbProgram.uuid,
@@ -534,61 +556,121 @@ export class SubtitleExtractorTask extends Task2<
       return;
     }
 
-    const outputResult = await Result.attemptAsync(async () => {
-      return await new ChildProcessHelper().getStdout(
-        ffmpegSetting.ffmpegExecutablePath,
-        [
-          '-nostdin',
-          '-hide_banner',
-          '-loglevel',
-          'warning',
-          ...(stream.get().streamSource.type === 'http'
-            ? new HttpReconnectOptions().options()
-            : []),
-          '-i',
-          `${stream.get().streamSource.path}`,
-          ...subtitleOutputArgs,
-        ],
-        {
-          swallowError: false,
-          isPath: true,
-          timeout: 500_000,
-        },
-      );
-    });
+    // ffmpeg writes into a folder of its own, removed afterwards whether the
+    // extraction worked, failed or timed out. Leaving these behind once filled
+    // a RAM-backed /tmp by several GB a day.
+    const workFolder = this.extractionWorkFolder();
+    await fs.mkdir(workFolder, { recursive: true });
+    const workDir = await fs.mkdtemp(path.join(workFolder, 'extract-'));
 
-    if (outputResult.isFailure()) {
-      this.logger.warn(outputResult.error, 'Failed to extract subtitles');
-      return;
-    }
+    try {
+      const subtitlesToSave = pending.map((item) => {
+        const ext = extname(item.outPath);
+        return {
+          ...item,
+          rawPath: path.join(workDir, `${item.index}.raw${ext}`),
+          cleanPath: path.join(workDir, `${item.index}${ext}`),
+        };
+      });
 
-    const copyResults = await Promise.allSettled(
-      subtitlesToSave.map(async ({ outPath, tmpPath }) => {
-        // Stream through a Transform that drops stray NUL bytes that some
-        // sources (notably mov_text -> ass and certain Plex muxers) embed
-        // inside the extracted text. libass refuses to parse a file that
-        // contains a NUL, which manifests as missing burn-in subtitles
-        // with no obvious ffmpeg-level error.
-        await pipeline(
-          createReadStream(tmpPath),
-          new Transform({
-            transform(chunk: Buffer, _encoding, cb) {
-              cb(
-                null,
-                chunk.filter((byte) => byte !== 0x00),
-              );
-            },
-          }),
-          createWriteStream(outPath),
+      const subtitleOutputArgs = subtitlesToSave.reduce((prev, curr) => {
+        const codec = curr.subtitle.codec === 'mov_text' ? 'text' : 'copy';
+        prev.push(
+          '-map',
+          `0:${curr.subtitle.index}`,
+          '-c:s',
+          codec,
+          `${curr.rawPath}`,
         );
-      }),
-    );
+        return prev;
+      }, [] as string[]);
 
-    for (const result of copyResults) {
-      if (result.status === 'rejected') {
-        this.logger.warn(result.reason, 'Failed to copy tmp subtitles');
+      const outputResult = await Result.attemptAsync(async () => {
+        return await new ChildProcessHelper().getStdout(
+          ffmpegSetting.ffmpegExecutablePath,
+          [
+            '-nostdin',
+            '-hide_banner',
+            '-loglevel',
+            'warning',
+            ...(stream.get().streamSource.type === 'http'
+              ? new HttpReconnectOptions().options()
+              : []),
+            '-i',
+            `${stream.get().streamSource.path}`,
+            ...subtitleOutputArgs,
+          ],
+          {
+            swallowError: false,
+            isPath: true,
+            timeout: 500_000,
+          },
+        );
+      });
+
+      if (outputResult.isFailure()) {
+        this.logger.warn(outputResult.error, 'Failed to extract subtitles');
+        return;
       }
+
+      const copyResults = await Promise.allSettled(
+        subtitlesToSave.map(async ({ outPath, rawPath, cleanPath }) => {
+          // Stream through a Transform that drops stray NUL bytes that some
+          // sources (notably mov_text -> ass and certain Plex muxers) embed
+          // inside the extracted text. libass refuses to parse a file that
+          // contains a NUL, which manifests as missing burn-in subtitles
+          // with no obvious ffmpeg-level error.
+          await pipeline(
+            createReadStream(rawPath),
+            new Transform({
+              transform(chunk: Buffer, _encoding, cb) {
+                cb(
+                  null,
+                  chunk.filter((byte) => byte !== 0x00),
+                );
+              },
+            }),
+            createWriteStream(cleanPath),
+          );
+          // The cache path only ever holds a whole file: a cached path counts
+          // as extracted, so a half-written one would never be redone.
+          await fs.mkdir(dirname(outPath), { recursive: true });
+          await fs.rename(cleanPath, outPath);
+        }),
+      );
+
+      for (const result of copyResults) {
+        if (result.status === 'rejected') {
+          this.logger.warn(result.reason, 'Failed to copy tmp subtitles');
+        }
+      }
+    } finally {
+      await fs
+        .rm(workDir, { recursive: true, force: true })
+        .catch((err) =>
+          this.logger.warn(
+            err,
+            'Unable to remove subtitle extraction folder %s',
+            workDir,
+          ),
+        );
     }
+  }
+
+  private extractionWorkFolder() {
+    return path.join(
+      this.globalOptions.databaseDirectory,
+      CacheFolderName,
+      ExtractionWorkFolderName,
+    );
+  }
+
+  private async clearExtractionWorkFolder() {
+    await fs
+      .rm(this.extractionWorkFolder(), { recursive: true, force: true })
+      .catch((err) =>
+        this.logger.warn(err, 'Unable to clear the subtitle extraction folder'),
+      );
   }
   private subtitleCacheFolder() {
     return path.join(
