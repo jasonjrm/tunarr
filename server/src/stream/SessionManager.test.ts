@@ -898,6 +898,27 @@ describe('session cap and stale-session sweep', () => {
     expect((await tune(manager, chB, 'b')).isSuccess()).toBe(true);
   });
 
+  it('holds back nothing for a starting session whose ffmpeg already holds GPU memory', async () => {
+    vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
+    vi.stubEnv('TUNARR_STREAM_VRAM_ESTIMATE_MB', '500');
+    const manager = makeMultiChannelManager(
+      (channel, options) =>
+        channel.uuid === chA
+          ? new SlowStartSession(channel, options)
+          : new StubHlsSession(channel, options),
+    );
+    // A is still starting, but its ffmpeg is already on the GPU (and in the 1000 free).
+    manager.probeResources = () =>
+      Promise.resolve({ vramMb: 1000, gpuFfmpegProcesses: 1 });
+
+    const pendingA = tune(manager, chA, 'a');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect((await tune(manager, chB, 'b')).isSuccess()).toBe(true);
+    await vi.advanceTimersByTimeAsync(3_000);
+    await pendingA;
+  });
+
   it('does not hold back memory for sessions that already started (no double count)', async () => {
     vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
     vi.stubEnv('TUNARR_STREAM_VRAM_ESTIMATE_MB', '500');

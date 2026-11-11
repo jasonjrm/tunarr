@@ -9,6 +9,11 @@ export type FreeResources = {
   vramMb?: number;
   /** MemAvailable from /proc/meminfo, MiB. Undefined off Linux. */
   ramMb?: number;
+  /**
+   * ffmpeg processes holding GPU memory right now (one per stream that has
+   * allocated). Undefined when nvidia-smi isn't available.
+   */
+  gpuFfmpegProcesses?: number;
 };
 
 /**
@@ -16,7 +21,7 @@ export type FreeResources = {
  * that fails is left out rather than failing the tune-in.
  */
 export async function probeFreeResources(): Promise<FreeResources> {
-  const [vram, ram] = await Promise.allSettled([
+  const [vram, ram, procs] = await Promise.allSettled([
     execFileAsync(
       'nvidia-smi',
       ['--query-gpu=memory.free', '--format=csv,noheader,nounits'],
@@ -26,8 +31,23 @@ export async function probeFreeResources(): Promise<FreeResources> {
       const match = /^MemAvailable:\s+(\d+) kB/m.exec(meminfo);
       return match ? Math.floor(parseInt(match[1]!, 10) / 1024) : NaN;
     }),
+    execFileAsync(
+      'nvidia-smi',
+      ['--query-compute-apps=process_name', '--format=csv,noheader'],
+      { timeout: 2_000 },
+    ).then(
+      ({ stdout }) =>
+        stdout
+          .split('\n')
+          .map((line) => line.trim().split('/').pop())
+          .filter((name) => name === 'ffmpeg').length,
+    ),
   ]);
   const value = (r: PromiseSettledResult<number>) =>
     r.status === 'fulfilled' && Number.isFinite(r.value) ? r.value : undefined;
-  return { vramMb: value(vram), ramMb: value(ram) };
+  return {
+    vramMb: value(vram),
+    ramMb: value(ram),
+    gpuFfmpegProcesses: value(procs),
+  };
 }

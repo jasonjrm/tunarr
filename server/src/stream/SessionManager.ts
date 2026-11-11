@@ -615,10 +615,16 @@ export class SessionManager {
       return;
     }
 
-    // Sessions still starting haven't allocated yet (see #ready); hold back
-    // what they will take.
-    const starting = active.filter((s) => !this.#ready.has(s)).length;
     const free = await this.probeResources();
+    // Hold back what streams that haven't allocated yet will take. Ready
+    // sessions have (see #ready). A starting one usually has too: ffmpeg
+    // allocates well before the first segments exist, so where nvidia-smi
+    // lists the ffmpeg processes on the GPU, count only sessions without one.
+    const notReady = active.filter((s) => !this.#ready.has(s)).length;
+    const starting =
+      free.gpuFfmpegProcesses === undefined
+        ? notReady
+        : Math.min(notReady, Math.max(0, active.length - free.gpuFfmpegProcesses));
     if (minVram > 0 && free.vramMb === undefined) {
       this.logger.warn('Free GPU memory probe failed (nvidia-smi); admitting without the VRAM check');
     }
