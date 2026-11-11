@@ -12,6 +12,8 @@ import {
   ffmpegTest,
   Fixtures,
 } from '../../../../testing/ffmpeg/FfmpegTestFixtures.ts';
+import type { FfmpegCapabilities } from '../../capabilities/FfmpegCapabilities.ts';
+import type { FfmpegVersionResult } from '../../../ffmpegInfo.ts';
 import {
   AudioFormats,
   defaultHlsOptions,
@@ -65,81 +67,118 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
     return result.status === 0 ? out : undefined;
   }
 
+  type RunOptions = {
+    source: string;
+    audioCodec: string;
+    streamBasePath: string;
+    segmentNameFormat: string;
+    ptsOffset?: number;
+    isFirstTranscode?: boolean;
+    binaryCapabilities: FfmpegCapabilities;
+    ffmpegVersion: FfmpegVersionResult;
+  };
+
+  /** Run one program of an HLS session through the hybrid pipeline. */
+  function runHybrid(opts: RunOptions) {
+    const video = VideoInputSource.withStream(
+      new FileStreamSource(opts.source),
+      VideoStream.create({
+        codec: 'h264',
+        displayAspectRatio: '16:9',
+        frameSize: FrameSize.withDimensions(1280, 720),
+        index: 0,
+        pixelFormat: new PixelFormatYuv420P(),
+        providedSampleAspectRatio: null,
+        colorFormat: null,
+      }),
+    );
+    const audio = AudioInputSource.withStream(
+      new FileStreamSource(opts.source),
+      AudioStream.create({ channels: 2, codec: opts.audioCodec, index: 1 }),
+      AudioState.create({
+        audioEncoder: AudioFormats.Aac,
+        audioChannels: 2,
+        audioBitrate: 192,
+        audioBufferSize: 384,
+        audioSampleRate: 48,
+      }),
+    );
+
+    // HlsSession creates the session directory before ffmpeg starts.
+    mkdirSync(path.join(workdir, opts.streamBasePath), { recursive: true });
+    const pipeline = new SoftwarePipelineBuilder(
+      video,
+      audio,
+      null,
+      null,
+      null,
+      opts.binaryCapabilities,
+    ).build(
+      FfmpegState.create({
+        version: opts.ffmpegVersion,
+        outputFormat: HlsOutputFormat({
+          ...defaultHlsOptions,
+          segmentBaseDirectory: workdir,
+          streamBasePath: opts.streamBasePath,
+          segmentNameFormat: opts.segmentNameFormat,
+          streamNameFormat: 'stream.m3u8',
+        }),
+        ptsOffset: opts.ptsOffset ?? 0,
+        isFirstTranscode: opts.isFirstTranscode ?? true,
+        emitEndList: true,
+      }),
+      new FrameState({
+        isAnamorphic: false,
+        scaledSize: FrameSize.withDimensions(1280, 720),
+        paddedSize: FrameSize.withDimensions(1280, 720),
+        videoFormat: VideoFormats.Copy,
+        videoTrackTimescale: 90000,
+        realtime: false,
+      }),
+      DefaultPipelineOptions,
+    );
+
+    const args = pipeline.getCommandArgs();
+    const { exitCode, stderr } = runFfmpegWithPipeline(binaries!.ffmpeg, args);
+    expect(exitCode, `${args.join(' ')}\n${stderr}`).toBe(0);
+    return args;
+  }
+
+  /** start_time (seconds) of each stream type in an MPEG-TS segment. */
+  function streamStarts(file: string): Record<string, number> {
+    const result = spawnSync(binaries!.ffprobe, [
+      '-v',
+      'quiet',
+      '-print_format',
+      'json',
+      '-show_entries',
+      'stream=codec_type,start_time',
+      file,
+    ]);
+    const streams = JSON.parse(result.stdout.toString()).streams as {
+      codec_type: string;
+      start_time: string;
+    }[];
+    return Object.fromEntries(
+      streams.map((s) => [s.codec_type, Number(s.start_time)]),
+    );
+  }
+
   ffmpegTest.for(['libopus', 'flac'] as const)(
     'MKV h264 + %s: video copied, audio AAC, master has a variant line',
     async (audioCodec, { binaryCapabilities, ffmpegVersion }) => {
       const source = makeMkv(audioCodec);
       expect(source, `could not build a ${audioCodec} MKV`).toBeDefined();
 
-      const video = VideoInputSource.withStream(
-        new FileStreamSource(source!),
-        VideoStream.create({
-          codec: 'h264',
-          displayAspectRatio: '16:9',
-          frameSize: FrameSize.withDimensions(1280, 720),
-          index: 0,
-          pixelFormat: new PixelFormatYuv420P(),
-          providedSampleAspectRatio: null,
-          colorFormat: null,
-        }),
-      );
-      const audio = AudioInputSource.withStream(
-        new FileStreamSource(source!),
-        AudioStream.create({
-          channels: 2,
-          codec: audioCodec === 'libopus' ? 'opus' : 'flac',
-          index: 1,
-        }),
-        AudioState.create({
-          audioEncoder: AudioFormats.Aac,
-          audioChannels: 2,
-          audioBitrate: 192,
-          audioBufferSize: 384,
-          audioSampleRate: 48,
-        }),
-      );
-
-      const builder = new SoftwarePipelineBuilder(
-        video,
-        audio,
-        null,
-        null,
-        null,
-        binaryCapabilities,
-      );
-
       const streamBasePath = `copy_${audioCodec}`;
-      // HlsSession creates the session directory before ffmpeg starts.
-      mkdirSync(path.join(workdir, streamBasePath), { recursive: true });
-      const pipeline = builder.build(
-        FfmpegState.create({
-          version: ffmpegVersion,
-          outputFormat: HlsOutputFormat({
-            ...defaultHlsOptions,
-            segmentBaseDirectory: workdir,
-            streamBasePath,
-            segmentNameFormat: 'seg%06d.ts',
-            streamNameFormat: 'stream.m3u8',
-          }),
-          emitEndList: true,
-        }),
-        new FrameState({
-          isAnamorphic: false,
-          scaledSize: FrameSize.withDimensions(1280, 720),
-          paddedSize: FrameSize.withDimensions(1280, 720),
-          videoFormat: VideoFormats.Copy,
-          videoTrackTimescale: 90000,
-          realtime: false,
-        }),
-        DefaultPipelineOptions,
-      );
-
-      const args = pipeline.getCommandArgs();
-      const { exitCode, stderr } = runFfmpegWithPipeline(
-        binaries!.ffmpeg,
-        args,
-      );
-      expect(exitCode, `${args.join(' ')}\n${stderr}`).toBe(0);
+      const args = runHybrid({
+        source: source!,
+        audioCodec: audioCodec === 'libopus' ? 'opus' : 'flac',
+        streamBasePath,
+        segmentNameFormat: 'seg%06d.ts',
+        binaryCapabilities,
+        ffmpegVersion,
+      });
 
       const joined = args.join(' ');
       expect(joined).toContain('-c:v copy');
@@ -158,6 +197,50 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
       );
       expect(codecs).toContain('video:h264');
       expect(codecs).toContain('audio:aac');
+    },
+  );
+
+  ffmpegTest(
+    'a later copied program continues the session timeline (PTS offset)',
+    async ({ binaryCapabilities, ffmpegVersion }) => {
+      const source = makeMkv('flac');
+      expect(source).toBeDefined();
+      const common = {
+        source: source!,
+        audioCodec: 'flac',
+        streamBasePath: 'copy_offset',
+        binaryCapabilities,
+        ffmpegVersion,
+      };
+
+      // Program 1 starts the session at 0; program 2 picks up at 60 s, the
+      // offset HlsSession would compute from the last segment's end.
+      runHybrid({ ...common, segmentNameFormat: 'a%06d.ts' });
+      const args = runHybrid({
+        ...common,
+        segmentNameFormat: 'b%06d.ts',
+        ptsOffset: 60 * 90000,
+        isFirstTranscode: false,
+      });
+      expect(args.join(' ')).toContain('-output_ts_offset 60');
+
+      const dir = path.join(workdir, 'copy_offset');
+      // append_list keeps numbering across programs, so find each program's
+      // first segment by its prefix.
+      const firstSegment = (prefix: string) => {
+        const name = readdirSync(dir)
+          .filter((f) => f.startsWith(prefix) && f.endsWith('.ts'))
+          .sort()[0];
+        expect(name, `no ${prefix}*.ts in ${readdirSync(dir)}`).toBeDefined();
+        return path.join(dir, name!);
+      };
+      const first = streamStarts(firstSegment('a'));
+      const second = streamStarts(firstSegment('b'));
+      expect(first['video']).toBeLessThan(5);
+      expect(second['video']).toBeGreaterThanOrEqual(60);
+      expect(second['video']).toBeLessThan(65);
+      expect(second['audio']).toBeGreaterThanOrEqual(59);
+      expect(second['audio']).toBeLessThan(65);
     },
   );
 });

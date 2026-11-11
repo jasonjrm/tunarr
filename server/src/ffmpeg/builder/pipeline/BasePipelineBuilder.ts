@@ -444,8 +444,11 @@ export abstract class BasePipelineBuilder implements PipelineBuilder {
       this.audioInputSource.addOption(new HttpReconnectOptions());
     }
 
+    // Copied video needs the offset too: without -copyts ffmpeg restarts a
+    // copied input at 0, the same as a transcoded one, and the HLS session
+    // expects each program to continue where the last one ended. (Copy-all
+    // passthrough returned above and keeps its own timeline.)
     if (
-      this.desiredState.videoFormat !== 'copy' &&
       (this.ffmpegState.ptsOffset ?? 0) > 0 &&
       !isNull(this.desiredState.videoTrackTimescale)
     ) {
@@ -1091,8 +1094,10 @@ export abstract class BasePipelineBuilder implements PipelineBuilder {
   private computeSubtitlePtsOffsetSeconds(): number {
     const ptsOffset = this.ffmpegState.ptsOffset ?? 0;
     const timescale = this.desiredState.videoTrackTimescale;
+    // Copy-all passthrough gets no video offset, so its cues get none either.
+    // Copied video on the transcode path is offset like any other program.
     if (
-      this.desiredState.videoFormat === 'copy' ||
+      this.ffmpegState.copyAllStreams ||
       ptsOffset <= 0 ||
       timescale === null
     ) {

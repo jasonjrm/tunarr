@@ -9,6 +9,7 @@ import {
   defaultHlsOptions,
   HlsDirectOutputFormat,
   HlsOutputFormat,
+  VideoFormats,
 } from '../constants.ts';
 import { AudioVolumeFilter } from '../filter/AudioVolumeFilter.ts';
 import { LoudnormFilter } from '../filter/LoudnormFilter.ts';
@@ -550,6 +551,67 @@ describe('BasePipelineBuilder', () => {
     // video/audio are still seeked (subtitle is not, so only 2 -ss flags)
     const seekCount = commandArgs.filter((arg) => arg === '-ss').length;
     expect(seekCount).toBe(2);
+  });
+
+  describe('PTS offset (-output_ts_offset)', () => {
+    const sixtySeconds = 60 * 90000;
+
+    function build(opts: { copyAllStreams?: boolean; sidecar?: boolean }) {
+      const offsetState = FfmpegState.create({
+        version: state.version,
+        ptsOffset: sixtySeconds,
+        isFirstTranscode: false,
+        copyAllStreams: opts.copyAllStreams ?? false,
+        outputFormat: HlsOutputFormat(defaultHlsOptions),
+      });
+      const subtitle = opts.sidecar
+        ? new SubtitlesInputSource(
+            new FileStreamSource('/path/to/movie.srt'),
+            [new ExternalSubtitleStream('subrip', SubtitleMethods.Convert)],
+            SubtitleMethods.Convert,
+          )
+        : null;
+      return new NoopPipelineBuilder(
+        makeVideo(),
+        makeAudio(),
+        null,
+        subtitle,
+        null,
+        EmptyFfmpegCapabilities,
+      )
+        .build(
+          offsetState,
+          new FrameState({
+            isAnamorphic: false,
+            paddedSize: FrameSize.FHD,
+            scaledSize: FrameSize.FHD,
+            videoFormat: VideoFormats.Copy,
+            videoTrackTimescale: 90000,
+          }),
+          DefaultPipelineOptions,
+        )
+        .getCommandArgs();
+    }
+
+    function offsets(args: string[]) {
+      return args.flatMap((arg, i) =>
+        arg === '-output_ts_offset' ? [args[i + 1]] : [],
+      );
+    }
+
+    test('copied video on the transcode path continues the session timeline', () => {
+      expect(offsets(build({}))).toEqual(['60']);
+    });
+
+    test('sidecar cues get the same offset as copied video', () => {
+      expect(offsets(build({ sidecar: true }))).toEqual(['60', '60']);
+    });
+
+    test('copy-all passthrough keeps its own timeline', () => {
+      expect(offsets(build({ copyAllStreams: true, sidecar: true }))).toEqual(
+        [],
+      );
+    });
   });
 
   describe('AV1 software decoder selection', () => {
