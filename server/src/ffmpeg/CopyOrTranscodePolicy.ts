@@ -175,8 +175,9 @@ function videoTranscodeReasons(input: CopyOrTranscodeInput): string[] {
   ) {
     reasons.push(`video: codec ${codec} not supported by MPEG-TS`);
   } else {
-    // An unknown profile is let through: plenty of sources don't report one,
-    // and the runtime fallback catches the files that really can't play.
+    // An unknown profile is let through: plenty of sources don't report one.
+    // Nothing downstream catches a wrong guess here: the server-side fallback
+    // only sees ffmpeg failing, not a client that can't decode what it copied.
     if (codecProfile && !supported.profiles.includes(codecProfile)) {
       reasons.push(`video: ${codec} profile "${codecProfile}" not supported`);
     }
