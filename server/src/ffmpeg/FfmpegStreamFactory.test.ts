@@ -880,7 +880,7 @@ describe('FfmpegStreamFactory', () => {
       expect(getCapturedFrameState()!.videoFormat).toBe(VideoFormats.H264);
     });
 
-    test('transcodes video when an image subtitle must be burned in', async () => {
+    test('skips an image subtitle, so the video still copies', async () => {
       const { sut, getCapturedFrameState, getCapturedSubtitleInput } = makeSut({
         subtitle: {
           type: 'embedded',
@@ -893,8 +893,8 @@ describe('FfmpegStreamFactory', () => {
         },
       });
       await run(sut);
-      expect(getCapturedFrameState()!.videoFormat).toBe(VideoFormats.H264);
-      expect(getCapturedSubtitleInput()!.method).toBe(SubtitleMethods.Burn);
+      expect(getCapturedFrameState()!.videoFormat).toBe(VideoFormats.Copy);
+      expect(getCapturedSubtitleInput()).toBeNull();
     });
 
     test('only applies to HLS output', async () => {
@@ -1341,7 +1341,7 @@ describe('FfmpegStreamFactory', () => {
         expect(result!.renditions.subtitle).toBeUndefined();
       });
 
-      test('falls back to burn-in for image-based subtitles even when sidecar enabled', async () => {
+      test('never burns image-based subtitles, even when the sidecar is enabled', async () => {
         const config = makeTranscodeConfig();
         const capturing = createCapturingPipelineBuilderFactory();
 
@@ -1371,9 +1371,7 @@ describe('FfmpegStreamFactory', () => {
           lineupItem: makeLineupItem(),
         });
 
-        const subtitleInput = capturing.getCapturedSubtitleInput();
-        expect(subtitleInput).not.toBeNull();
-        expect(subtitleInput!.method).toBe(SubtitleMethods.Burn);
+        expect(capturing.getCapturedSubtitleInput()).toBeNull();
         expect(result!.renditions.subtitle).toBeUndefined();
       });
 

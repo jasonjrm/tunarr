@@ -594,7 +594,7 @@ export class FfmpegStreamFactory {
 
     // Stream selection via profiles (handles both audio and subtitles)
     if (isDefined(streamDetails.audioDetails)) {
-      const { audioStream, subtitleStream } =
+      const { audioStream, subtitleStream: pickedSubtitle } =
         await this.streamSelector.selectAudioAndSubtitleStreams({
           channel: this.channel,
           lineupItem,
@@ -602,6 +602,20 @@ export class FfmpegStreamFactory {
           subtitleStreams: streamDetails.subtitleDetails ?? [],
         });
       selectedAudio = audioStream;
+      // Image subtitles (PGS, VobSub) are never shown in this fork: they can
+      // only be burned in, which would ignore the viewer's CC choice and force
+      // a video transcode. Text subtitles go out as the WebVTT sidecar.
+      const subtitleStream =
+        pickedSubtitle && isImageBasedSubtitle(pickedSubtitle.codec)
+          ? null
+          : pickedSubtitle;
+      if (pickedSubtitle && !subtitleStream) {
+        this.logger.debug(
+          'Skipping image-based subtitle %s (%s)',
+          pickedSubtitle.index ?? pickedSubtitle.path,
+          pickedSubtitle.codec,
+        );
+      }
       selectedSubtitle = subtitleStream ?? undefined;
 
       audioInput = new AudioInputSource(
