@@ -420,6 +420,16 @@ export class FfmpegStreamFactory {
 
     const copiesVideo = isPassthrough || copyVideo;
 
+    // Copied video starts on the keyframe before the seek point; seek its
+    // sidecar subtitles to that keyframe too, or the cues show early.
+    const subtitleStart =
+      copyVideo &&
+      +startTime > 0 &&
+      subtitleSource?.method === SubtitleMethods.Convert &&
+      streamSource.type === 'file'
+        ? await this.ffmpegInfo.keyframeAtOrBefore(streamSource.path, startTime)
+        : undefined;
+
     // When video is copied, use the source video's actual dimensions so no
     // scaling or padding filters are injected. For normal transcode, use the
     // transcode config's target resolution.
@@ -478,6 +488,7 @@ export class FfmpegStreamFactory {
       FfmpegState.create({
         version: await this.ffmpegInfo.getVersion(),
         start: startTime,
+        subtitleStart: subtitleStart ?? null,
         duration,
         ptsOffset,
         isFirstTranscode,

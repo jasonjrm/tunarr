@@ -1,7 +1,13 @@
 import dayjs from 'dayjs';
 import duration from 'dayjs/plugin/duration.js';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { FileStreamSource } from '../../../../stream/types.ts';
 import {
@@ -24,8 +30,14 @@ import {
 } from '../../constants.ts';
 import { PixelFormatYuv420P } from '../../format/PixelFormat.ts';
 import { AudioInputSource } from '../../input/AudioInputSource.ts';
+import { SubtitlesInputSource } from '../../input/SubtitlesInputSource.ts';
 import { VideoInputSource } from '../../input/VideoInputSource.ts';
-import { AudioStream, VideoStream } from '../../MediaStream.ts';
+import {
+  AudioStream,
+  ExternalSubtitleStream,
+  SubtitleMethods,
+  VideoStream,
+} from '../../MediaStream.ts';
 import { AudioState } from '../../state/AudioState.ts';
 import {
   DefaultPipelineOptions,
@@ -79,6 +91,10 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
     ptsOffset?: number;
     /** Seek into the source (ms), as when tuning in mid-program. */
     startMs?: number;
+    /** An external SRT sent as the WebVTT sidecar. */
+    subtitlePath?: string;
+    /** Where to seek the subtitle input instead of startMs (ms). */
+    subtitleStartMs?: number;
     isFirstTranscode?: boolean;
     binaryCapabilities: FfmpegCapabilities;
     ffmpegVersion: FfmpegVersionResult;
@@ -112,11 +128,18 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
 
     // HlsSession creates the session directory before ffmpeg starts.
     mkdirSync(path.join(workdir, opts.streamBasePath), { recursive: true });
+    const subtitle = opts.subtitlePath
+      ? new SubtitlesInputSource(
+          new FileStreamSource(opts.subtitlePath),
+          [new ExternalSubtitleStream('subrip', SubtitleMethods.Convert)],
+          SubtitleMethods.Convert,
+        )
+      : null;
     const pipeline = new SoftwarePipelineBuilder(
       video,
       audio,
       null,
-      null,
+      subtitle,
       null,
       opts.binaryCapabilities,
     ).build(
@@ -131,6 +154,10 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
         }),
         ptsOffset: opts.ptsOffset ?? 0,
         start: opts.startMs ? dayjs.duration(opts.startMs) : undefined,
+        subtitleStart:
+          opts.subtitleStartMs !== undefined
+            ? dayjs.duration(opts.subtitleStartMs)
+            : undefined,
         isFirstTranscode: opts.isFirstTranscode ?? true,
         emitEndList: true,
       }),
@@ -465,6 +492,74 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
           maxSyncErrorMs,
         );
       }
+    },
+  );
+
+  ffmpegTest(
+    'sidecar subtitles start at the copied video keyframe after a mid-program tune-in',
+    async ({ binaryCapabilities, ffmpegVersion, ffmpegInfo }) => {
+      // 15 s source, keyframes at 0 s and 10 s; one cue at 10.0 s.
+      const source = path.join(workdir, 'subs_long_gop.mkv');
+      const made = spawnSync(binaries!.ffmpeg, [
+        '-y',
+        '-stream_loop',
+        '5',
+        '-i',
+        Fixtures.video720p,
+        '-t',
+        '15',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-g',
+        '300',
+        '-keyint_min',
+        '300',
+        '-sc_threshold',
+        '0',
+        '-c:a',
+        'flac',
+        source,
+      ]);
+      expect(made.status, made.stderr?.toString()).toBe(0);
+      const srt = path.join(workdir, 'ten.srt');
+      writeFileSync(srt, '1\n00:00:10,000 --> 00:00:11,000\nTEN\n');
+
+      // Tune in at 7 s: the copied video can only start at the 0 s keyframe.
+      const keyframe = await ffmpegInfo.keyframeAtOrBefore(
+        source,
+        dayjs.duration(7000),
+      );
+      // The first video frame of the clip is one frame (33 ms) in.
+      expect(keyframe!.asMilliseconds()).toBeLessThan(100);
+
+      runHybrid({
+        source,
+        audioCodec: 'flac',
+        streamBasePath: 'subs_seek',
+        segmentNameFormat: 'v%06d.ts',
+        startMs: 7000,
+        subtitlePath: srt,
+        subtitleStartMs: keyframe!.asMilliseconds(),
+        binaryCapabilities,
+        ffmpegVersion,
+      });
+
+      const dir = path.join(workdir, 'subs_seek');
+      const vtt = readdirSync(dir)
+        .filter((f) => f.endsWith('.vtt'))
+        .map((f) => readFileSync(path.join(dir, f), 'utf-8'))
+        .join('\n');
+      const cue = vtt.match(/(?:(\d+):)?(\d+):(\d+\.\d+) -->[^\n]*\nTEN/);
+      expect(cue, vtt).not.toBeNull();
+      const seconds =
+        Number(cue![1] ?? 0) * 3600 + Number(cue![2]) * 60 + Number(cue![3]);
+      // The video shows content 10 s at output 10 s minus the keyframe offset,
+      // so the cue must too (seeking the subtitles to 7 s would put it at 3 s).
+      expect(Math.abs(seconds - (10 - keyframe!.asSeconds()))).toBeLessThan(
+        0.05,
+      );
     },
   );
 });

@@ -888,7 +888,9 @@ export abstract class BasePipelineBuilder implements PipelineBuilder {
       ) {
         this.subtitleInputSource.addOptions(
           new SeekTimestampInputOption(),
-          option,
+          this.ffmpegState.subtitleStart
+            ? new StreamSeekInputOption(this.ffmpegState.subtitleStart)
+            : option,
         );
       }
 

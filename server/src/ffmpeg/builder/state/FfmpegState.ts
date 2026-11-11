@@ -68,6 +68,12 @@ export class FfmpegState {
 
   threadCount: Nullable<number> = null;
   start: Nullable<Duration> = null;
+  /**
+   * Where to seek a sidecar subtitle input when it must differ from `start`:
+   * copied video begins at the keyframe before `start`, so its subtitles have
+   * to begin there too.
+   */
+  subtitleStart: Nullable<Duration> = null;
   duration: Nullable<Duration> = null;
   logLevel: FfmpegLogLevel = 'error';
   // metadata

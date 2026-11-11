@@ -21,6 +21,7 @@ import {
   split,
   trim,
 } from 'lodash-es';
+import type { Duration } from 'dayjs/plugin/duration.js';
 import NodeCache from 'node-cache';
 import { format } from 'node:util';
 import { attempt, isNonEmptyString, parseIntOrNull } from '../util/index.ts';
@@ -355,6 +356,57 @@ export class FfmpegInfo {
     }
 
     return result.data;
+  }
+
+  /**
+   * Where a seek to `start` lands in a file whose video is copied: the time,
+   * relative to the file's start like ffmpeg's -ss, of the video keyframe at or
+   * before `start`. ffprobe seeks the same way ffmpeg does. Undefined when it
+   * can't be determined.
+   */
+  async keyframeAtOrBefore(
+    path: string,
+    start: Duration,
+    timeoutMs = 5000,
+  ): Promise<Duration | undefined> {
+    try {
+      const output = await this.getFfprobeStdout(
+        [
+          '-v',
+          'error',
+          '-select_streams',
+          'v:0',
+          '-skip_frame',
+          'nokey',
+          '-read_intervals',
+          `${start.asSeconds()}%+#1`,
+          '-show_entries',
+          'frame=pts_time:format=start_time',
+          '-print_format',
+          'json',
+          path,
+        ],
+        { timeout: timeoutMs, swallowError: false },
+      );
+      const parsed = JSON.parse(output) as {
+        frames?: { pts_time?: string }[];
+        format?: { start_time?: string };
+      };
+      const pts = Number(parsed.frames?.[0]?.pts_time);
+      const fileStart = Number(parsed.format?.start_time ?? 0);
+      if (!Number.isFinite(pts) || !Number.isFinite(fileStart)) {
+        return undefined;
+      }
+      const relativeMs = Math.round((pts - fileStart) * 1000);
+      // ffmpeg can only land at or before the request; anything else is noise.
+      if (relativeMs < 0 || relativeMs > start.asMilliseconds()) {
+        return undefined;
+      }
+      return dayjs.duration(relativeMs);
+    } catch (e) {
+      this.logger.debug(e, 'Could not probe the keyframe before %s', path);
+      return undefined;
+    }
   }
 
   private getFfmpegStdout(
