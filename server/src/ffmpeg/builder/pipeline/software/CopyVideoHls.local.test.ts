@@ -303,4 +303,168 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
       ).toBeLessThan(0.5);
     },
   );
+
+  /**
+   * Lip-sync clip: black video with one white frame every 2 s and a 100 ms
+   * 1 kHz beep starting at the same instants. Video keyframe every 2 s.
+   */
+  function makeSyncClip(seconds: number) {
+    const out = path.join(workdir, `sync_${seconds}.mkv`);
+    const made = spawnSync(binaries!.ffmpeg, [
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      'color=c=black:s=1280x720:r=25,drawbox=c=white:t=fill:enable=lt(mod(t\\,2)\\,0.04)',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=1000:sample_rate=48000,volume=if(lt(mod(t\\,2)\\,0.1)\\,1\\,0):eval=frame',
+      '-t',
+      `${seconds}`,
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-g',
+      '50',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'flac',
+      out,
+    ]);
+    expect(made.status, made.stderr?.toString()).toBe(0);
+    return out;
+  }
+
+  /**
+   * Read a session's segments back in order (the playlist's URIs carry the
+   * stream base URL, so join the files instead) and pair every flash with the
+   * nearest beep onset. Returns the offsets in ms (beep minus flash).
+   */
+  function measureSync(dir: string): number[] {
+    const segments = readdirSync(dir)
+      .filter((f) => f.endsWith('.ts'))
+      .sort()
+      .map((f) => path.join(dir, f));
+    const result = spawnSync(binaries!.ffmpeg, [
+      '-hide_banner',
+      '-nostats',
+      '-i',
+      `concat:${segments.join('|')}`,
+      '-vf',
+      'signalstats,metadata=print:key=lavfi.signalstats.YAVG',
+      '-af',
+      'silencedetect=n=-40dB:d=0.05',
+      '-f',
+      'null',
+      '-',
+    ]);
+    const log = result.stderr.toString();
+    const flashes: number[] = [];
+    const beeps: number[] = [];
+    let t = 0;
+    let previous = 0;
+    for (const line of log.split('\n')) {
+      const pts = line.match(/pts_time:([0-9.]+)/);
+      if (pts) t = Number(pts[1]);
+      const luma = line.match(/YAVG=([0-9.]+)/);
+      if (luma) {
+        const y = Number(luma[1]);
+        if (y > 128 && previous <= 128) flashes.push(t);
+        previous = y;
+      }
+      const onset = line.match(/silence_end: ([0-9.]+)/);
+      if (onset) beeps.push(Number(onset[1]));
+    }
+    return flashes.flatMap((f) => {
+      const nearest = beeps.reduce(
+        (best, b) => (Math.abs(b - f) < Math.abs(best - f) ? b : best),
+        Infinity,
+      );
+      // A flash with no beep near it is the clip's first (audio starts
+      // loud, so silencedetect reports no onset there).
+      return Math.abs(nearest - f) < 0.5 ? [(nearest - f) * 1000] : [];
+    });
+  }
+
+  // Broadcast lip-sync tolerance is roughly 45 ms audio-late / 15 ms early
+  // (ITU-R BT.1359 detectability); one 25 fps frame is 40 ms.
+  const maxSyncErrorMs = 45;
+
+  ffmpegTest(
+    'lip sync: copied video + AAC stay within 45 ms, from the start',
+    async ({ binaryCapabilities, ffmpegVersion }) => {
+      const clip = makeSyncClip(12);
+      runHybrid({
+        source: clip,
+        audioCodec: 'flac',
+        streamBasePath: 'sync_start',
+        segmentNameFormat: 'a%06d.ts',
+        binaryCapabilities,
+        ffmpegVersion,
+      });
+      const offsets = measureSync(path.join(workdir, 'sync_start'));
+      expect(offsets.length, JSON.stringify(offsets)).toBeGreaterThanOrEqual(4);
+      for (const ms of offsets) {
+        expect(Math.abs(ms), JSON.stringify(offsets)).toBeLessThanOrEqual(
+          maxSyncErrorMs,
+        );
+      }
+    },
+  );
+
+  ffmpegTest(
+    'lip sync: tuning in mid-program keeps sync',
+    async ({ binaryCapabilities, ffmpegVersion }) => {
+      const clip = makeSyncClip(12);
+      runHybrid({
+        source: clip,
+        audioCodec: 'flac',
+        streamBasePath: 'sync_seek',
+        segmentNameFormat: 'a%06d.ts',
+        startMs: 3300,
+        binaryCapabilities,
+        ffmpegVersion,
+      });
+      const offsets = measureSync(path.join(workdir, 'sync_seek'));
+      expect(offsets.length, JSON.stringify(offsets)).toBeGreaterThanOrEqual(3);
+      for (const ms of offsets) {
+        expect(Math.abs(ms), JSON.stringify(offsets)).toBeLessThanOrEqual(
+          maxSyncErrorMs,
+        );
+      }
+    },
+  );
+
+  ffmpegTest(
+    'lip sync: a second copied program on the session timeline keeps sync',
+    async ({ binaryCapabilities, ffmpegVersion }) => {
+      const clip = makeSyncClip(12);
+      const common = {
+        source: clip,
+        audioCodec: 'flac',
+        streamBasePath: 'sync_two',
+        binaryCapabilities,
+        ffmpegVersion,
+      };
+      runHybrid({ ...common, segmentNameFormat: 'a%06d.ts' });
+      // The session continues where program 1 ended (12 s).
+      runHybrid({
+        ...common,
+        segmentNameFormat: 'b%06d.ts',
+        ptsOffset: 12 * 90000,
+        isFirstTranscode: false,
+      });
+      const offsets = measureSync(path.join(workdir, 'sync_two'));
+      // Both programs' flashes, not just the first's.
+      expect(offsets.length, JSON.stringify(offsets)).toBeGreaterThanOrEqual(9);
+      for (const ms of offsets) {
+        expect(Math.abs(ms), JSON.stringify(offsets)).toBeLessThanOrEqual(
+          maxSyncErrorMs,
+        );
+      }
+    },
+  );
 });
