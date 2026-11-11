@@ -530,10 +530,13 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       return; // stopped or killed by us
     }
     const expectedMs = dayjs(this.transcodedUntil).diff(programStart);
-    const writtenMs = Math.max(
-      0,
-      ((await this.getPtsOffset()) - ptsOffset) / 90,
-    );
+    const nextOffset = await this.measurePtsOffset();
+    if (nextOffset === undefined && exitCode === 0) {
+      // Ended cleanly but the output could not be measured: don't replay a
+      // program that probably played in full.
+      return;
+    }
+    const writtenMs = Math.max(0, ((nextOffset ?? ptsOffset) - ptsOffset) / 90);
     const shortMs = expectedMs - writtenMs;
     if (exitCode === 0 && shortMs <= CopyFallbackShortfallMs) {
       return;
@@ -594,13 +597,21 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   }
 
   private async getPtsOffset() {
+    return (await this.measurePtsOffset()) ?? 0;
+  }
+
+  /**
+   * The PTS (90 kHz ticks) the next program should start at, from the newest
+   * segment; undefined when there is no segment or it could not be probed.
+   */
+  private async measurePtsOffset(): Promise<number | undefined> {
     const lastSegment = await this.getLastSegment();
 
     if (!lastSegment) {
       if (!this.#isFirstTranscode) {
         this.logger.debug('No last segment found. Starting with PTS offset 0.');
       }
-      return 0;
+      return undefined;
     }
 
     const result = await new GetSegmentStreamEndsTask(this.settingsDB).run(
@@ -609,7 +620,7 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
 
     if (result.isFailure()) {
       this.logger.error(result.error);
-      return 0;
+      return undefined;
     }
 
     return nextProgramPtsOffset(result.get(), await this.getAudioEncoderLead());

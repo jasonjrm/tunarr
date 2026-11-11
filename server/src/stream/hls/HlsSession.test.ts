@@ -589,15 +589,15 @@ describe('copied-video fallback (CT-4)', () => {
    * `runs` is one ffmpeg run of it; `writtenTicks[i]` is the PTS offset the
    * session reads after run i (90 kHz ticks).
    */
-  async function play(runs: Run[], writtenTicks: number[]) {
+  async function play(runs: Run[], writtenTicks: (number | undefined)[]) {
     // The first program of a session starts at 0 without reading an offset.
-    const ptsOffsets = [...writtenTicks];
+    const ptsOffsets: (number | undefined)[] = [...writtenTicks];
     vi.spyOn(
       HlsSession.prototype as unknown as {
-        getPtsOffset(): Promise<number>;
+        measurePtsOffset(): Promise<number | undefined>;
       },
-      'getPtsOffset',
-    ).mockImplementation(() => Promise.resolve(ptsOffsets.shift() ?? 0));
+      'measurePtsOffset',
+    ).mockImplementation(() => Promise.resolve(ptsOffsets.shift()));
     vi.spyOn(MeasureAudioEncoderLeadTask.prototype, 'run').mockResolvedValue(
       Result.success(0),
     );
@@ -721,6 +721,32 @@ describe('copied-video fallback (CT-4)', () => {
 
     expect(requests.map((r) => r.copyVideo)).toEqual([true, true]);
     expect(lineupStarts[1]! - lineupStarts[0]!).toBe(50_000);
+  });
+
+  test('a clean exit whose output cannot be measured is not replayed', async () => {
+    const { requests, lineupStarts } = await play(
+      [
+        { copiedVideo: true, exitCode: 0 },
+        { copiedVideo: true, exitCode: 0 },
+      ],
+      [undefined, 0],
+    );
+
+    expect(requests.map((r) => r.copyVideo)).toEqual([true, true]);
+    expect(lineupStarts[1]! - lineupStarts[0]!).toBe(50_000);
+  });
+
+  test('a failed copied program whose output cannot be measured is replayed from its start', async () => {
+    const { requests, lineupStarts } = await play(
+      [
+        { copiedVideo: true, exitCode: 1 },
+        { copiedVideo: false, exitCode: 0 },
+      ],
+      [undefined, 0],
+    );
+
+    expect(requests.map((r) => r.copyVideo)).toEqual([true, false]);
+    expect(lineupStarts[1]! - lineupStarts[0]!).toBe(0);
   });
 
   test('a failed transcoded program is not retried here (it keeps the error screen path)', async () => {
