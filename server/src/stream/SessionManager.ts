@@ -237,6 +237,11 @@ export class SessionManager {
     this.#sweepTimer.unref();
   }
 
+  stopStaleSessionSweep() {
+    clearInterval(this.#sweepTimer);
+    this.#sweepTimer = undefined;
+  }
+
   cleanupStaleSessions() {
     for (const session of Object.values(this.#sessions)) {
       if (session.state === 'starting') {

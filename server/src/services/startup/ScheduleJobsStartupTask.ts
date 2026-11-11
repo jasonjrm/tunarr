@@ -12,7 +12,8 @@ import { SyncCollectionsTask } from '../../tasks/SyncCollectionsTask.ts';
 import { SyncCustomShowsTask } from '../../tasks/SyncCustomShowsTask.ts';
 import { UpdateXmlTvTask } from '../../tasks/UpdateXmlTvTask.ts';
 import { SessionManager } from '../../stream/SessionManager.ts';
-import { getNumericEnvVar, TUNARR_ENV_VARS } from '../../util/env.ts';
+import { getEnvVar, getNumericEnvVar, TUNARR_ENV_VARS } from '../../util/env.ts';
+import { LiveConfig } from '../../util/liveConfig.ts';
 import { autoFactoryKey, KEYS } from '../../types/inject.ts';
 import { InjectLogger } from '../../util/inject.ts';
 import type { Logger } from '../../util/logging/LoggerFactory.ts';
@@ -60,10 +61,42 @@ export class ScheduleJobsStartupTask extends SimpleStartupTask {
       ),
     );
 
-    const sweepMs = getNumericEnvVar(TUNARR_ENV_VARS.SESSION_SWEEP_INTERVAL_MS);
-    if (sweepMs && sweepMs > 0) {
-      container.get(SessionManager).startStaleSessionSweep(sweepMs);
+    const sessionManager = container.get(SessionManager);
+    let sweepMs = getNumericEnvVar(TUNARR_ENV_VARS.SESSION_SWEEP_INTERVAL_MS);
+    const applySweep = () => {
+      if (sweepMs && sweepMs > 0) {
+        sessionManager.startStaleSessionSweep(sweepMs);
+      } else {
+        sessionManager.stopStaleSessionSweep();
+      }
+    };
+
+    // Stream limits from a KEY=value file, re-read when it changes, so the cap
+    // and timings can be tuned without a restart.
+    const configPath = getEnvVar(TUNARR_ENV_VARS.TUNAAR_CONFIG);
+    if (configPath) {
+      const liveConfig = new LiveConfig(configPath);
+      const reload = () => {
+        const result = liveConfig.reloadIfChanged();
+        if (!result) {
+          return;
+        }
+        for (const problem of result.problems) {
+          this.logger.warn('%s: %s', configPath, problem);
+        }
+        if (Object.keys(result.changed).length > 0) {
+          this.logger.info('%s: applied %j', configPath, result.changed);
+        }
+        const nextSweep = getNumericEnvVar(TUNARR_ENV_VARS.SESSION_SWEEP_INTERVAL_MS);
+        if (nextSweep !== sweepMs) {
+          sweepMs = nextSweep;
+          applySweep();
+        }
+      };
+      reload();
+      setInterval(reload, 5_000).unref();
     }
+    applySweep();
 
     GlobalScheduler.scheduleTask(
       OnDemandChannelStateTask.ID,
