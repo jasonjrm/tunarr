@@ -43,6 +43,7 @@ const channelUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
 type MakeSessionOverrides = {
   streamMode?: HlsSessionOptions['streamMode'];
+  channel?: Partial<ChannelOrmWithTranscodeConfig>;
   transcodeConfig?: Partial<ChannelOrmWithTranscodeConfig['transcodeConfig']>;
   settingsDB?: ISettingsDB;
 };
@@ -54,6 +55,7 @@ function makeSession(
   const channel = {
     uuid: channelUuid,
     transcodeConfig: overrides.transcodeConfig ?? {},
+    ...overrides.channel,
   } as ChannelOrmWithTranscodeConfig;
 
   const options = {
@@ -93,6 +95,88 @@ describe('HlsSession', () => {
       const result = await session.getMasterPlaylist();
       expect(result.isSuccess()).toBe(true);
       expect(result.get()).toBeUndefined();
+    });
+
+    describe('subtitle rendition (sidecar)', () => {
+      const savedEnv = process.env.TUNARR_WEBVTT_SIDECAR_ENABLED;
+      afterEach(() => {
+        if (savedEnv === undefined) {
+          delete process.env.TUNARR_WEBVTT_SIDECAR_ENABLED;
+        } else {
+          process.env.TUNARR_WEBVTT_SIDECAR_ENABLED = savedEnv;
+        }
+      });
+
+      async function master(
+        channel: Partial<ChannelOrmWithTranscodeConfig>,
+        sidecar: boolean,
+      ) {
+        delete process.env.TUNARR_WEBVTT_SIDECAR_ENABLED;
+        const session = makeSession(dir.name, {
+          channel,
+          settingsDB: {
+            featureFlags: () => ({ webvttSidecarEnabled: sidecar }),
+          } as unknown as ISettingsDB,
+        });
+        await fs.mkdir(session.workingDirectory, { recursive: true });
+        await fs.writeFile(
+          path.join(session.workingDirectory, 'playlist.m3u8'),
+          '#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-STREAM-INF:BANDWIDTH=3511200,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2"\nstream.m3u8\n',
+        );
+        return { session, text: (await session.getMasterPlaylist()).get()! };
+      }
+
+      test('advertised for the whole session, off by default, before any program has subtitles', async () => {
+        const { text } = await master({ subtitlesEnabled: true }, true);
+        expect(text).toContain('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs"');
+        expect(text).toContain('DEFAULT=NO,AUTOSELECT=NO');
+        expect(text).toMatch(/#EXT-X-STREAM-INF:.*SUBTITLES="subs"/);
+      });
+
+      test('a stream selection profile alone is enough', async () => {
+        const { text } = await master(
+          { streamSelectionProfileId: 'profile-1' },
+          true,
+        );
+        expect(text).toContain('TYPE=SUBTITLES');
+      });
+
+      test('not advertised when the sidecar is off', async () => {
+        const { text } = await master({ subtitlesEnabled: true }, false);
+        expect(text).not.toContain('SUBTITLES');
+      });
+
+      test('not advertised on a channel that never selects subtitles', async () => {
+        const { text } = await master({}, true);
+        expect(text).not.toContain('SUBTITLES');
+      });
+
+      test('the env override turns the sidecar on', async () => {
+        const session = makeSession(dir.name, {
+          channel: { subtitlesEnabled: true },
+          settingsDB: {
+            featureFlags: () => ({ webvttSidecarEnabled: false }),
+          } as unknown as ISettingsDB,
+        });
+        process.env.TUNARR_WEBVTT_SIDECAR_ENABLED = 'true';
+        await fs.mkdir(session.workingDirectory, { recursive: true });
+        await fs.writeFile(
+          path.join(session.workingDirectory, 'playlist.m3u8'),
+          '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nstream.m3u8\n',
+        );
+        expect((await session.getMasterPlaylist()).get()).toContain(
+          'TYPE=SUBTITLES',
+        );
+      });
+
+      test('the same rendition on every request', async () => {
+        const { session, text } = await master(
+          { subtitlesEnabled: true },
+          true,
+        );
+        process.env.TUNARR_WEBVTT_SIDECAR_ENABLED = 'false';
+        expect((await session.getMasterPlaylist()).get()).toBe(text);
+      });
     });
   });
 

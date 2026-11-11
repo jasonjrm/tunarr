@@ -21,6 +21,8 @@ import type {
 import { Result } from '@/types/result.js';
 import type { Maybe } from '@/types/util.js';
 import { isContentBackedLineupItem } from '@/db/derived_types/StreamLineup.js';
+import { resolveFeatureFlagFromEnv } from '@/services/FeatureFlagService.js';
+import { TUNARR_ENV_VARS } from '@/util/env.js';
 import { isCopyVideoChannel } from '@/util/copyVideoChannels.js';
 import { fileExists } from '@/util/fsUtil.js';
 import { wait } from '@/util/index.js';
@@ -93,6 +95,9 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   // Taken once, here: a live-config edit applies to the next session, never to
   // one that is already streaming, and every program in this session agrees.
   readonly #copyVideo: boolean;
+  // The subtitle rendition the master playlist advertises, fixed for the
+  // session once chosen (clients read the master once, at tune-in).
+  #advertisedSubtitles: SubtitleRenditionInfo | null | undefined;
   // Programs whose copied video failed in this session. They are retried, and
   // replayed later in the session, as a full transcode.
   readonly #copyVideoFailed = new Set<string>();
@@ -123,7 +128,7 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         return undefined;
       }
       const content = await fs.readFile(this._masterPlaylistPath, 'utf-8');
-      const rendition = this.#currentSubtitleRendition;
+      const rendition = this.advertisedSubtitleRendition();
       const hlsOptions = this.getHlsOptions();
       const lines = HlsMasterPlaylistMutator.rewriteVariantPlaylistUrls(
         content,
@@ -551,6 +556,54 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       Math.round(expectedMs / 1000),
       exitCode ?? 'none',
     );
+  }
+
+  /**
+   * One subtitle rendition for the whole session, so a viewer who tunes in
+   * during a program without subtitles still gets them for later programs.
+   * Advertised when the WebVTT sidecar is on and the channel can select
+   * subtitles; programs without any serve empty windows. Off by default
+   * (DEFAULT/AUTOSELECT=NO): the viewer switches it on with CC.
+   */
+  private advertisedSubtitleRendition(): SubtitleRenditionInfo | undefined {
+    if (this.#advertisedSubtitles === undefined) {
+      const current = this.#currentSubtitleRendition;
+      if (this.sidecarEnabled() && this.channelMaySelectSubtitles()) {
+        this.#advertisedSubtitles = {
+          language: current?.language ?? 'und',
+          languageName: current?.languageName,
+          title: 'Subtitles',
+          default: false,
+          forced: false,
+        };
+      } else if (current) {
+        // Sidecar off but a rendition exists (e.g. hls_direct_v2): keep the
+        // per-program behaviour, without switching it on for the viewer.
+        return { ...current, default: false };
+      } else {
+        return undefined;
+      }
+    }
+    return this.#advertisedSubtitles ?? undefined;
+  }
+
+  private channelMaySelectSubtitles(): boolean {
+    return (
+      !!this.channel.subtitlesEnabled || !!this.channel.streamSelectionProfileId
+    );
+  }
+
+  // Same resolution as FeatureFlagService: an env override wins, else settings.
+  private sidecarEnabled(): boolean {
+    const envValue = process.env[TUNARR_ENV_VARS.WEBVTT_SIDECAR_ENABLED];
+    if (envValue !== undefined && envValue !== '') {
+      return resolveFeatureFlagFromEnv('webvttSidecarEnabled');
+    }
+    try {
+      return this.settingsDB.featureFlags().webvttSidecarEnabled ?? false;
+    } catch {
+      return false;
+    }
   }
 
   protected override getAdditionalRequiredFiles(): string[] {
