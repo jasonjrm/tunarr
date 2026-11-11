@@ -13,9 +13,22 @@ import { pinnedEtvNextVersion } from './EtvNextVersion.ts';
 
 const ENV_VAR = 'TUNARR_ERSATZTV_NEXT_PATH';
 
-afterEach(() => {
+const tempDirs: string[] = [];
+
+async function makeTempDir() {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'etv-resolver-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+afterEach(async () => {
   delete process.env[ENV_VAR];
   vi.restoreAllMocks();
+  await Promise.all(
+    tempDirs
+      .splice(0)
+      .map((dir) => fs.rm(dir, { recursive: true, force: true })),
+  );
 });
 
 describe('candidatePaths', () => {
@@ -73,7 +86,7 @@ describe('resolveChecked', () => {
     source: 'bundled' | 'env',
     versionOutput: string,
   ) {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'etv-resolver-'));
+    const dir = await makeTempDir();
     const binary = path.join(dir, ETV_NEXT_BINARY_NAME);
     await fs.writeFile(binary, '');
 
@@ -158,7 +171,7 @@ describe('resolveChecked', () => {
 
 describe('getInstalledVersion', () => {
   test('returns undefined when the binary is missing', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'etv-resolver-'));
+    const dir = await makeTempDir();
     vi.spyOn(process, 'cwd').mockReturnValue(dir);
     const childProcessHelper = {
       getStdout: vi.fn(),
@@ -170,7 +183,7 @@ describe('getInstalledVersion', () => {
   });
 
   test('returns undefined when the version probe fails', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'etv-resolver-'));
+    const dir = await makeTempDir();
     await fs.writeFile(path.join(dir, ETV_NEXT_BINARY_NAME), '');
     vi.spyOn(process, 'cwd').mockReturnValue(dir);
     const childProcessHelper = {
@@ -182,7 +195,7 @@ describe('getInstalledVersion', () => {
   });
 
   test('reads the full version once and caches it', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'etv-resolver-'));
+    const dir = await makeTempDir();
     await fs.writeFile(path.join(dir, ETV_NEXT_BINARY_NAME), '');
     vi.spyOn(process, 'cwd').mockReturnValue(dir);
     const childProcessHelper = {

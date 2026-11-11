@@ -422,6 +422,9 @@ export class BasicChannelRepository {
         tx.delete(Channel).where(eq(Channel.uuid, channelId)).run();
       });
 
+      // The channel is gone, so its lineup can no longer be restored.
+      await this.lineupRepository.removeLineupBackup(channelId);
+
       const removeRefs = () =>
         this.lineupRepository.removeRedirectReferences(channelId).catch(() => {
           // Errors are logged inside removeRedirectReferences

@@ -13,6 +13,25 @@ import path from 'node:path';
 import type stream from 'node:stream';
 import { LastNBytesStream } from '../util/LastNBytesStream.ts';
 
+const FfmpegErrorLogRegex = /^ffmpeg-error-log-.+-(\d+)\.log$/;
+
+// One file is written per unexpected exit and nothing else removes them.
+export const MaxFfmpegErrorLogs = 100;
+
+/** Deletes all but the newest `keep` ffmpeg error logs in `directory`. */
+export async function pruneFfmpegErrorLogs(
+  directory: string,
+  keep: number = MaxFfmpegErrorLogs,
+): Promise<void> {
+  const logs = (await fs.readdir(directory))
+    .map((name) => ({ name, at: name.match(FfmpegErrorLogRegex)?.[1] }))
+    .filter((log): log is { name: string; at: string } => log.at !== undefined)
+    .sort((a, b) => Number(b.at) - Number(a.at));
+  for (const { name } of logs.slice(keep)) {
+    await fs.rm(path.join(directory, name), { force: true });
+  }
+}
+
 export type FfmpegEvents = {
   // Emitted when the process ended with a code === 0, i.e. it exited
   // normally and cleanly and finished work.
@@ -182,14 +201,20 @@ export class FfmpegProcess extends events.EventEmitter<FfmpegEvents> {
         fs.writeFile(
           outPath,
           bufferedBytes + `\n\nOriginal command: ${argsWithTokenRedacted}`,
-        ).catch((e) => {
-          this.#logger.error(
-            e,
-            'Failed to write last %d bytes to out path: %s',
-            bufferedOut.bufSizeBytes,
-            outPath,
-          );
-        });
+        ).then(
+          () =>
+            pruneFfmpegErrorLogs(this.logDirectory).catch((e) => {
+              this.#logger.warn(e, 'Failed to prune old ffmpeg error logs');
+            }),
+          (e) => {
+            this.#logger.error(
+              e,
+              'Failed to write last %d bytes to out path: %s',
+              bufferedOut.bufSizeBytes,
+              outPath,
+            );
+          },
+        );
 
         if (code === 255 && !this.#processKilled) {
           if (this.#processHandle) {

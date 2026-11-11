@@ -228,6 +228,21 @@ export class LineupRepository {
     return this.markLineupFileForDeletion(channelId, false);
   }
 
+  /**
+   * markLineupFileForDeletion keeps a .bak so a failed delete can be undone.
+   * Once the channel row is gone nothing reads it again, and a client that
+   * recreates channels would otherwise leave one behind per channel per run.
+   */
+  async removeLineupBackup(channelId: string): Promise<void> {
+    const path = join(
+      globalOptions().databaseDirectory,
+      `channel-lineups/${channelId}.json.bak`,
+    );
+    await fs.rm(path, { force: true }).catch((e: unknown) => {
+      this.logger.warn(e, 'Unable to remove lineup backup %s', path);
+    });
+  }
+
   async removeRedirectReferences(toChannel: string): Promise<void> {
     const allChannels = await this.drizzleDB.query.channels
       .findMany({
