@@ -831,12 +831,16 @@ describe('session cap and stale-session sweep', () => {
     vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
     vi.stubEnv('TUNARR_SESSION_EVICT_IDLE_MS', '10000');
     const manager = makeMultiChannelManager();
-    let freeVram = 4000;
-    manager.probeResources = () => Promise.resolve({ vramMb: freeVram, ramMb: 8000 });
+    // Something else takes the GPU while A runs: 600 MiB free; A's 3400 come back when it stops.
+    let squeezed = false;
+    const live = () =>
+      Object.values(manager.allSessions()).filter((s) => !s.stoppingOrStopped).length;
+    manager.probeResources = () =>
+      Promise.resolve({ vramMb: squeezed && live() > 0 ? 600 : 4000, ramMb: 8000 });
 
     const a = (await tune(manager, chA, 'a')).get();
     await vi.advanceTimersByTimeAsync(15_000);
-    freeVram = 600;
+    squeezed = true;
 
     const b = await tune(manager, chB, 'b');
     await vi.advanceTimersByTimeAsync(0);
@@ -860,19 +864,64 @@ describe('session cap and stale-session sweep', () => {
     expect(a.error.message).toContain('600 MiB GPU memory free');
   });
 
-  it('holds back GPU memory for streams that are still starting', async () => {
+  it('holds back GPU memory for a session too new to have allocated', async () => {
     vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
     vi.stubEnv('TUNARR_STREAM_VRAM_ESTIMATE_MB', '500');
     const manager = makeMultiChannelManager();
+    // The probe never sees A's memory: like two tune-ins a second apart.
     manager.probeResources = () => Promise.resolve({ vramMb: 1000 });
 
     const a = (await tune(manager, chA, 'a')).get();
-    (a as any).state = 'starting'; // hasn't allocated yet: 1000 free - 500 held < 700
+    expect(a.state).toBe('started'); // HLS sessions leave 'starting' at once
+
+    const b = await tune(manager, chB, 'b'); // 1000 free - 500 held for A < 700
+
+    expect(b.isFailure()).toBe(true);
+    expect(manager.getHlsSession(chA)).toBe(a);
+
+    // Once A is past the allocation grace, the probe is trusted again.
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect((await tune(manager, chB, 'b')).isSuccess()).toBe(true);
+  });
+
+  it('never ends a session too new to have its viewer registered', async () => {
+    vi.stubEnv('TUNARR_MAX_SESSIONS', '1');
+    vi.stubEnv('TUNARR_SESSION_EVICT_IDLE_MS', '0');
+    const manager = makeMultiChannelManager();
+
+    const a = (await tune(manager, chA, 'a')).get();
+    a.removeConnection('a'); // as if its viewer weren't registered yet
 
     const b = await tune(manager, chB, 'b');
 
     expect(b.isFailure()).toBe(true);
     expect(manager.getHlsSession(chA)).toBe(a);
+  });
+
+  it('keeps ending idle sessions until the new one fits, waiting for each to stop', async () => {
+    vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
+    vi.stubEnv('TUNARR_SESSION_EVICT_IDLE_MS', '10000');
+    const manager = makeMultiChannelManager();
+    // 6000 MiB GPU, every live session holds 2000: 2000 free with both, 4000 with one.
+    const live = () =>
+      Object.values(manager.allSessions()).filter((s) => !s.stoppingOrStopped).length;
+    manager.probeResources = () => Promise.resolve({ vramMb: 6000 - 2000 * live() });
+
+    const a = (await tune(manager, chA, 'a')).get();
+    await vi.advanceTimersByTimeAsync(11_000);
+    const b = (await tune(manager, chB, 'b')).get();
+    await vi.advanceTimersByTimeAsync(11_000); // both idle and past the grace
+    // Now ask for more than one session's worth: only ending both makes room.
+    vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '4500');
+
+    const pending = tune(manager, chC, 'c');
+    await vi.advanceTimersByTimeAsync(0);
+    const c = await pending;
+
+    expect(c.isSuccess()).toBe(true);
+    expect(a.stoppingOrStopped).toBe(true);
+    expect(b.stoppingOrStopped).toBe(true);
+    expect(Object.keys(manager.allSessions())).toHaveLength(1);
   });
 
   it('starts sessions while there is room, and skips a probe that failed', async () => {

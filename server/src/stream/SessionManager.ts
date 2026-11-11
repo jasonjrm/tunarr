@@ -64,9 +64,17 @@ export type SessionKey = `${string}_${SessionType}`;
 // two channels starting at once can't both take the last slot.
 const CapacityLockKey = '__session_capacity__';
 const DefaultEvictIdleMs = 10_000;
-// What a stream that is still starting will take once its ffmpeg allocates.
+// What a new stream will take once its ffmpeg allocates.
 const DefaultStreamVramEstimateMb = 500;
 const DefaultStreamRamEstimateMb = 300;
+// HLS sessions report 'started' before ffmpeg has even spawned; it takes a
+// few seconds to allocate. Until then a probe doesn't see a new session's
+// memory, so admission holds back an estimate for it, and it can't be ended
+// to make room (its viewer may not be registered yet).
+const StreamAllocGraceMs = 10_000;
+// How long to wait for an ended session's ffmpeg to exit (and free its
+// memory) before checking for room again.
+const EvictionStopWaitMs = 5_000;
 
 const isConcatSessionType = (sessionType: string) =>
   (SessionConcatStreamModes as readonly string[]).includes(sessionType);
@@ -87,6 +95,7 @@ export class SessionManager {
   #sessionLocker = new MutexMap();
   #sessions: Record<SessionKey, Session> = {};
   #sweepTimer?: NodeJS.Timeout;
+  #createdAt = new WeakMap<Session, number>();
   /** Replaced in tests. */
   probeResources: () => Promise<FreeResources> = probeFreeResources;
 
@@ -383,7 +392,11 @@ export class SessionManager {
           session = await capacityLock.runExclusive(async () => {
             await this.reclaimCapacity(channelId, sessionType);
             const created = sessionFactory(channel);
+            this.#createdAt.set(created, dayjs().valueOf());
             this.addSession(channel.uuid, created.sessionType, created);
+            // Registered before the lock is released, so the next admission
+            // never sees this session with no viewer.
+            created.addConnection(token, connection);
             return created;
           });
 
@@ -524,47 +537,68 @@ export class SessionManager {
     if (isConcatSessionType(sessionType)) {
       return;
     }
-    const active = filter(
-      values(this.#sessions),
-      (s) => !s.stoppingOrStopped && !isConcatSessionType(s.sessionType),
-    );
-    const shortfall = await this.capacityShortfall(active);
-    if (!shortfall) {
-      return;
-    }
-
     const idleMs =
       getNumericEnvVar(TUNARR_ENV_VARS.SESSION_EVICT_IDLE_MS) ??
       DefaultEvictIdleMs;
-    const now = dayjs().valueOf();
-    const victim = minBy(
-      filter(
-        active.map((session) => ({ session, lastSeen: newestHeartbeat(session) })),
-        ({ session, lastSeen }) =>
-          session.state !== 'starting' && now - lastSeen >= idleMs,
-      ),
-      'lastSeen',
-    );
 
-    if (!victim) {
-      this.logger.warn(
-        'No room (%s) and every session has a viewer; refusing %s on channel %s',
+    // Each ended session frees a slot at once but its memory only when its
+    // ffmpeg exits, and one may not be enough: end one, wait, check again.
+    // A session whose stop outlasts the wait is still counted, never re-picked.
+    const ended = new Set<Session>();
+    for (;;) {
+      const active = filter(
+        values(this.#sessions),
+        (s) => !s.stoppingOrStopped && !isConcatSessionType(s.sessionType),
+      );
+      const shortfall = await this.capacityShortfall(active);
+      if (!shortfall) {
+        return;
+      }
+
+      const now = dayjs().valueOf();
+      const victim = minBy(
+        filter(
+          active.map((session) => ({ session, lastSeen: newestHeartbeat(session) })),
+          ({ session, lastSeen }) =>
+            !ended.has(session) &&
+            session.state !== 'starting' &&
+            now - lastSeen >= idleMs &&
+            now - (this.#createdAt.get(session) ?? 0) >= StreamAllocGraceMs,
+        ),
+        'lastSeen',
+      );
+
+      if (!victim) {
+        this.logger.warn(
+          'No room (%s) and every session has a viewer; refusing %s on channel %s',
+          shortfall,
+          sessionType,
+          channelId,
+        );
+        throw new SessionCapacityError(shortfall);
+      }
+
+      this.logger.info(
+        this.getLoggerContext(victim.session.id),
+        'No room (%s): ending a session idle for %dms to start %s on channel %s',
         shortfall,
+        now - victim.lastSeen,
         sessionType,
         channelId,
       );
-      throw new SessionCapacityError(shortfall);
+      // Wait (bounded) for its ffmpeg to exit so the next probe sees the
+      // memory it freed.
+      ended.add(victim.session);
+      await Promise.race([
+        this.endSession(victim.session).catch((e) =>
+          this.logger.error(
+            this.getLoggerContext(victim.session.id, e),
+            'Error ending session to make room',
+          ),
+        ),
+        new Promise((resolve) => setTimeout(resolve, EvictionStopWaitMs)),
+      ]);
     }
-
-    this.logger.info(
-      this.getLoggerContext(victim.session.id),
-      'No room (%s): ending a session idle for %dms to start %s on channel %s',
-      shortfall,
-      now - victim.lastSeen,
-      sessionType,
-      channelId,
-    );
-    await this.endSessionInBackground(victim.session);
   }
 
   /** Why another stream doesn't fit right now, or undefined if it does. */
@@ -580,9 +614,20 @@ export class SessionManager {
       return;
     }
 
-    // Starting streams haven't allocated yet; hold back what they will take.
-    const starting = active.filter((s) => s.state === 'starting').length;
+    // Sessions this new haven't allocated yet (see StreamAllocGraceMs); hold
+    // back what they will take. A session that allocated quickly is counted
+    // twice for a few seconds: errs toward refusing, never toward overfilling.
+    const now = dayjs().valueOf();
+    const starting = active.filter(
+      (s) => now - (this.#createdAt.get(s) ?? 0) < StreamAllocGraceMs,
+    ).length;
     const free = await this.probeResources();
+    if (minVram > 0 && free.vramMb === undefined) {
+      this.logger.warn('Free GPU memory probe failed (nvidia-smi); admitting without the VRAM check');
+    }
+    if (minRam > 0 && free.ramMb === undefined) {
+      this.logger.warn('Available RAM probe failed (/proc/meminfo); admitting without the RAM check');
+    }
     const vramNeed =
       minVram +
       starting *
