@@ -14,6 +14,7 @@ describe('LiveConfig', () => {
     file = path.join(dir, 'tunaar.conf');
     delete process.env.TUNARR_MAX_SESSIONS;
     delete process.env.TUNARR_SESSION_EVICT_IDLE_MS;
+    delete process.env.TUNARR_COPY_VIDEO_CHANNELS;
   });
 
   afterEach(() => {
@@ -72,5 +73,25 @@ describe('LiveConfig', () => {
     rmSync(file);
     cfg.reloadIfChanged();
     expect(process.env.TUNARR_MAX_SESSIONS).toBeUndefined();
+  });
+
+  it('accepts a channel list for TUNARR_COPY_VIDEO_CHANNELS, and an empty one', () => {
+    const cfg = new LiveConfig(file);
+    write('TUNARR_COPY_VIDEO_CHANNELS=990, 991,992\n', 1000);
+    expect(cfg.reloadIfChanged()!.problems).toEqual([]);
+    expect(process.env.TUNARR_COPY_VIDEO_CHANNELS).toBe('990, 991,992');
+    write('TUNARR_COPY_VIDEO_CHANNELS=\n', 2000);
+    expect(cfg.reloadIfChanged()!.problems).toEqual([]);
+    expect(process.env.TUNARR_COPY_VIDEO_CHANNELS).toBe('');
+  });
+
+  it('rejects a malformed channel list and keeps the previous value', () => {
+    const cfg = new LiveConfig(file);
+    write('TUNARR_COPY_VIDEO_CHANNELS=990\n', 1000);
+    cfg.reloadIfChanged();
+    write('TUNARR_COPY_VIDEO_CHANNELS=990,abc\n', 2000);
+    const r = cfg.reloadIfChanged()!;
+    expect(process.env.TUNARR_COPY_VIDEO_CHANNELS).toBe('990');
+    expect(r.problems[0]).toContain('comma-separated list');
   });
 });

@@ -41,6 +41,9 @@ const STREAM_VRAM_ESTIMATE_MB = 'TUNARR_STREAM_VRAM_ESTIMATE_MB';
 const STREAM_RAM_ESTIMATE_MB = 'TUNARR_STREAM_RAM_ESTIMATE_MB';
 const FFMPEG_INITIAL_BURST_SECONDS = 'TUNARR_FFMPEG_INITIAL_BURST_SECONDS';
 const TUNAAR_CONFIG = 'TUNARR_TUNAAR_CONFIG';
+// Comma-separated channel numbers whose programs may copy video
+// (copy-or-transcode policy). Empty or unset = every channel transcodes.
+const COPY_VIDEO_CHANNELS = 'TUNARR_COPY_VIDEO_CHANNELS';
 
 // "Feature flags"
 const PROXY_ARTWORK_ENV_VAR = 'TUNARR_PROXY_ARTWORK';
@@ -100,6 +103,7 @@ export const TUNARR_ENV_VARS = {
   STREAM_RAM_ESTIMATE_MB,
   FFMPEG_INITIAL_BURST_SECONDS,
   TUNAAR_CONFIG,
+  COPY_VIDEO_CHANNELS,
   CORS_ORIGINS_ENV_VAR,
 } as const;
 

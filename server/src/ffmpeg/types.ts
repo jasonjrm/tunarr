@@ -114,4 +114,10 @@ export type StreamOptions = {
   /** When true, FFmpeg writes `#EXT-X-ENDLIST` on exit (for finite HLS streams). */
   emitEndList?: boolean;
   disableErrorStream?: boolean;
+  /**
+   * The channel may copy video for programs the client can play as-is
+   * (copy-or-transcode policy). Snapshotted once per HLS session, so every
+   * program in a session sees the same value.
+   */
+  copyVideo?: boolean;
 };

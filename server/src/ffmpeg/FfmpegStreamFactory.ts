@@ -11,9 +11,11 @@ import {
 import { InfiniteLoopInputOption } from '@/ffmpeg/builder/options/input/InfiniteLoopInputOption.js';
 import type {
   AudioRenditionInfo,
+  AudioStreamDetails,
   StreamDetails,
   StreamRenditions,
   SubtitleRenditionInfo,
+  SubtitleStreamDetails,
 } from '@/stream/types.js';
 import { FileStreamSource, HttpStreamSource } from '@/stream/types.js';
 import type { Maybe, Nullable } from '@/types/util.js';
@@ -52,6 +54,10 @@ import { FfmpegPlaybackParamsCalculator } from './FfmpegPlaybackParamsCalculator
 import { FfmpegProcess } from './FfmpegProcess.ts';
 import { FfmpegTranscodeSession } from './FfmpegTrancodeSession.ts';
 import { StreamSelector } from './StreamSelector.ts';
+import {
+  decideCopyOrTranscode,
+  SyndieClientProfile,
+} from './CopyOrTranscodePolicy.ts';
 import {
   AudioStream,
   EmbeddedSubtitleStream,
@@ -318,6 +324,7 @@ export class FfmpegStreamFactory {
       isFirstTranscode,
       emitEndList,
       subtitleSegmentStartNumber,
+      copyVideo: copyVideoAllowed,
     },
     lineupItem,
   }: StreamSessionCreateArgs): Promise<Maybe<TranscodeSessionResult>> {
@@ -351,15 +358,57 @@ export class FfmpegStreamFactory {
     let subtitleSource: Nullable<SubtitlesInputSource> = null;
     let subtitleRendition: SubtitleRenditionInfo | undefined;
 
+    // Copy-or-transcode: on opted-in channels a program whose video the client
+    // can play as-is copies it, while audio and subtitles still go through the
+    // transcode path (one selected track, AAC). Audio is always re-encoded for
+    // now: copying it would skip the resample/pad filters that keep sync.
+    let copyVideo = false;
+
     if (!isPassthrough) {
-      ({ audioInput, subtitleSource, subtitleRendition, watermarkSource } =
-        await this.buildTranscodeInputs(
-          streamSource,
-          streamDetails,
-          lineupItem,
-          playbackParams!,
-          { duration, streamMode, watermark },
-        ));
+      let selectedAudio: Maybe<AudioStreamDetails>;
+      let selectedSubtitle: Maybe<SubtitleStreamDetails>;
+      ({
+        audioInput,
+        subtitleSource,
+        subtitleRendition,
+        watermarkSource,
+        selectedAudio,
+        selectedSubtitle,
+      } = await this.buildTranscodeInputs(
+        streamSource,
+        streamDetails,
+        lineupItem,
+        playbackParams!,
+        { duration, streamMode, watermark },
+      ));
+
+      if (copyVideoAllowed && outputFormat.type === OutputFormatTypes.Hls) {
+        const decision = decideCopyOrTranscode({
+          video: streamDetails.videoDetails?.[0],
+          containerBitrate: streamDetails.bitrate,
+          audio: selectedAudio,
+          subtitle: selectedSubtitle,
+          profile: SyndieClientProfile,
+          channel: {
+            mode: 'auto',
+            watermark: !!watermarkSource,
+            loudnorm: !!this.transcodeConfig.audioLoudnormConfig,
+            assSubtitles: 'sidecar',
+            sidecarEnabled: this.featureFlagService.get('webvttSidecarEnabled'),
+          },
+        });
+        copyVideo = decision.video === 'copy';
+        this.logger.info(
+          'Channel %d program %s: video %s, audio transcode (policy: %s)%s',
+          this.channel.number,
+          lineupItem.program.uuid,
+          decision.video,
+          decision.audio,
+          decision.reasons.length > 0
+            ? ` - ${decision.reasons.join('; ')}`
+            : '',
+        );
+      }
     } else {
       ({ subtitleSource, subtitleRendition } =
         await this.buildPassthroughSubtitles(
@@ -369,11 +418,13 @@ export class FfmpegStreamFactory {
         ));
     }
 
-    // For copy-all, use the source video's actual dimensions so no scaling or
-    // padding filters are injected. For normal transcode, use the transcode
-    // config's target resolution.
+    const copiesVideo = isPassthrough || copyVideo;
+
+    // When video is copied, use the source video's actual dimensions so no
+    // scaling or padding filters are injected. For normal transcode, use the
+    // transcode config's target resolution.
     const sourceFrameSize =
-      isPassthrough && streamDetails.videoDetails
+      copiesVideo && streamDetails.videoDetails
         ? FrameSize.create({
             height: streamDetails.videoDetails[0].height,
             width: streamDetails.videoDetails[0].width,
@@ -395,7 +446,7 @@ export class FfmpegStreamFactory {
       ? this.buildAudioCodecOverrides(streamDetails)
       : [];
 
-    const effectiveHwAccel = isPassthrough
+    const effectiveHwAccel = copiesVideo
       ? HardwareAccelerationMode.None
       : (playbackParams?.hwAccel ?? 'none');
 
@@ -436,39 +487,39 @@ export class FfmpegStreamFactory {
         copyAllStreams: isPassthrough,
         audioCodecOverrides,
         outputFormat,
-        softwareDeinterlaceFilter: isPassthrough
+        softwareDeinterlaceFilter: copiesVideo
           ? undefined
           : this.ffmpegSettings.deinterlaceFilter,
-        softwareScalingAlgorithm: isPassthrough
+        softwareScalingAlgorithm: copiesVideo
           ? undefined
           : this.ffmpegSettings.scalingAlgorithm,
-        vaapiDevice: isPassthrough ? null : this.getVaapiDevice(),
-        vaapiDriver: isPassthrough ? null : this.getVaapiDriver(),
+        vaapiDevice: copiesVideo ? null : this.getVaapiDevice(),
+        vaapiDriver: copiesVideo ? null : this.getVaapiDriver(),
         logLevel: this.ffmpegSettings.logLevel,
       }),
       new FrameState({
         isAnamorphic: false,
         scaledSize,
         paddedSize,
-        videoBitrate: isPassthrough ? undefined : playbackParams!.videoBitrate,
-        videoBufferSize: isPassthrough
+        videoBitrate: copiesVideo ? undefined : playbackParams!.videoBitrate,
+        videoBufferSize: copiesVideo
           ? undefined
           : playbackParams!.videoBufferSize,
-        pixelFormat: isPassthrough
+        pixelFormat: copiesVideo
           ? new PixelFormatYuv420P()
           : (playbackParams!.pixelFormat ?? new PixelFormatYuv420P()),
         bitDepth: 8,
-        frameRate: isPassthrough ? undefined : playbackParams!.frameRate,
-        videoTrackTimescale: isPassthrough
+        frameRate: copiesVideo ? undefined : playbackParams!.frameRate,
+        videoTrackTimescale: copiesVideo
           ? 90000
           : playbackParams!.videoTrackTimeScale,
         realtime,
-        videoFormat: isPassthrough
+        videoFormat: copiesVideo
           ? VideoFormats.Copy
           : playbackParams!.videoFormat,
-        videoPreset: isPassthrough ? undefined : playbackParams!.videoPreset,
+        videoPreset: copiesVideo ? undefined : playbackParams!.videoPreset,
         videoProfile: null,
-        deinterlace: isPassthrough ? false : playbackParams!.deinterlace,
+        deinterlace: copiesVideo ? false : playbackParams!.deinterlace,
         infiniteLoop: lineupItem.infiniteLoop,
       }),
       pipelineOptions,
@@ -510,6 +561,8 @@ export class FfmpegStreamFactory {
     subtitleSource: Nullable<SubtitlesInputSource>;
     subtitleRendition: SubtitleRenditionInfo | undefined;
     watermarkSource: Nullable<WatermarkInputSource>;
+    selectedAudio: Maybe<AudioStreamDetails>;
+    selectedSubtitle: Maybe<SubtitleStreamDetails>;
   }> {
     const { duration, streamMode, watermark } = options;
 
@@ -524,6 +577,8 @@ export class FfmpegStreamFactory {
     let audioInput: Nullable<AudioInputSource> = null;
     let subtitleSource: Nullable<SubtitlesInputSource> = null;
     let subtitleRendition: SubtitleRenditionInfo | undefined;
+    let selectedAudio: Maybe<AudioStreamDetails>;
+    let selectedSubtitle: Maybe<SubtitleStreamDetails>;
 
     // Stream selection via profiles (handles both audio and subtitles)
     if (isDefined(streamDetails.audioDetails)) {
@@ -534,6 +589,8 @@ export class FfmpegStreamFactory {
           audioStreams: streamDetails.audioDetails,
           subtitleStreams: streamDetails.subtitleDetails ?? [],
         });
+      selectedAudio = audioStream;
+      selectedSubtitle = subtitleStream ?? undefined;
 
       audioInput = new AudioInputSource(
         streamSource,
@@ -617,7 +674,14 @@ export class FfmpegStreamFactory {
       );
     }
 
-    return { audioInput, subtitleSource, subtitleRendition, watermarkSource };
+    return {
+      audioInput,
+      subtitleSource,
+      subtitleRendition,
+      watermarkSource,
+      selectedAudio,
+      selectedSubtitle,
+    };
   }
 
   /**

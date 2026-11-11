@@ -20,6 +20,7 @@ import type {
 } from '@/stream/types.js';
 import { Result } from '@/types/result.js';
 import type { Maybe } from '@/types/util.js';
+import { isCopyVideoChannel } from '@/util/copyVideoChannels.js';
 import { fileExists } from '@/util/fsUtil.js';
 import { wait } from '@/util/index.js';
 import { seq } from '@tunarr/shared/util';
@@ -84,6 +85,9 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   #lastDiscontinuitySequence: number | undefined;
   #currentSubtitleRendition: SubtitleRenditionInfo | undefined;
   #currentAudioRenditions: AudioRenditionInfo[] = [];
+  // Taken once, here: a live-config edit applies to the next session, never to
+  // one that is already streaming, and every program in this session agrees.
+  readonly #copyVideo: boolean;
 
   constructor(
     channel: ChannelOrmWithTranscodeConfig,
@@ -94,6 +98,7 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     private programStreamFactory: ProgramStreamFactory,
   ) {
     super(channel, options);
+    this.#copyVideo = isCopyVideoChannel(channel.number);
   }
 
   public get sessionType(): HlsSessionOptions['streamMode'] {
@@ -524,6 +529,7 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       ptsOffset,
       isFirstTranscode: this.#isFirstTranscode,
       subtitleSegmentStartNumber,
+      copyVideo: this.#copyVideo,
     });
   }
 

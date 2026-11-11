@@ -18,7 +18,20 @@ export const LiveConfigKeys: ReadonlySet<string> = new Set([
   TUNARR_ENV_VARS.STREAM_VRAM_ESTIMATE_MB,
   TUNARR_ENV_VARS.STREAM_RAM_ESTIMATE_MB,
   TUNARR_ENV_VARS.FFMPEG_INITIAL_BURST_SECONDS,
+  TUNARR_ENV_VARS.COPY_VIDEO_CHANNELS,
 ]);
+
+/** Keys whose value is a comma-separated list of whole numbers (may be empty). */
+const ListKeys: ReadonlySet<string> = new Set([
+  TUNARR_ENV_VARS.COPY_VIDEO_CHANNELS,
+]);
+
+function isValidValue(key: string, value: string): boolean {
+  if (ListKeys.has(key)) {
+    return /^(\d+(\s*,\s*\d+)*)?$/.test(value);
+  }
+  return /^\d+$/.test(value);
+}
 
 export type LiveConfigResult = {
   /** Keys whose effective value changed, with the new value (undefined = removed). */
@@ -29,7 +42,8 @@ export type LiveConfigResult = {
 
 /**
  * Apply a KEY=value settings file to process.env. Blank lines and # comments
- * are skipped; values must be whole numbers >= 0. A bad line keeps the
+ * are skipped; values must be whole numbers >= 0 (list keys: comma-separated
+ * whole numbers, or empty). A bad line keeps the
  * previous value. A key removed from the file goes back to the value the
  * process started with (or unset).
  */
@@ -79,8 +93,9 @@ export class LiveConfig {
       const value = eq > 0 ? line.slice(eq + 1).trim() : '';
       if (!LiveConfigKeys.has(key)) {
         problems.push(`line ${i + 1}: ${key} is not a live setting; ignored`);
-      } else if (!/^\d+$/.test(value)) {
-        problems.push(`line ${i + 1}: ${key}=${value} is not a whole number >= 0; keeping ${process.env[key] ?? 'unset'}`);
+      } else if (!isValidValue(key, value)) {
+        const expected = ListKeys.has(key) ? 'a comma-separated list of whole numbers' : 'a whole number >= 0';
+        problems.push(`line ${i + 1}: ${key}=${value} is not ${expected}; keeping ${process.env[key] ?? 'unset'}`);
         if (process.env[key] !== undefined) {
           wanted.set(key, process.env[key]);
         }

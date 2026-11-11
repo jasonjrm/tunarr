@@ -21,6 +21,7 @@ import { FfmpegState } from '@/ffmpeg/builder/state/FfmpegState.ts';
 import type { FfmpegInfo, FfmpegVersionResult } from '@/ffmpeg/ffmpegInfo.ts';
 import type { StreamSelector } from '@/ffmpeg/StreamSelector.ts';
 import type { FeatureFlagService } from '@/services/FeatureFlagService.ts';
+import type { Watermark } from '@tunarr/types';
 import type { SessionConcatStreamMode } from '@tunarr/types/schemas';
 import type { StreamDetails, SubtitleStreamDetails } from '@/stream/types.ts';
 import { FileStreamSource, HttpStreamSource } from '@/stream/types.ts';
@@ -754,6 +755,152 @@ describe('FfmpegStreamFactory', () => {
       expect(frameState.scaledSize.height).toBe(2160);
       expect(frameState.paddedSize.width).toBe(3840);
       expect(frameState.paddedSize.height).toBe(2160);
+    });
+  });
+
+  describe('copy-or-transcode (copyVideo option)', () => {
+    const hlsFormat = HlsOutputFormat(defaultHlsOptions);
+
+    function makeSut(
+      opts: {
+        config?: Partial<TranscodeConfigOrm>;
+        subtitle?: SubtitleStreamDetails | null;
+      } = {},
+    ) {
+      const capturing = createCapturingPipelineBuilderFactory();
+      const sut = new FfmpegStreamFactory(
+        makeMockFfmpegInfo(),
+        makeMockSettingsDB(makeFfmpegSettings()),
+        capturing.factory,
+        makeMockFeatureFlagService(),
+        makeMockStreamSelector(opts.subtitle ?? null),
+        makeTranscodeConfig(opts.config),
+        makeChannel(),
+      );
+      return { sut, ...capturing };
+    }
+
+    function run(
+      sut: FfmpegStreamFactory,
+      overrides: {
+        details?: StreamDetails;
+        copyVideo?: boolean;
+        outputFormat?:
+          | ReturnType<typeof HlsOutputFormat>
+          | typeof MpegTsOutputFormat;
+        watermark?: Watermark;
+      } = {},
+    ) {
+      return sut.createStreamSession({
+        stream: {
+          source: new HttpStreamSource('http://example.com/video.mkv'),
+          details: overrides.details ?? makeStreamDetails(),
+        },
+        options: {
+          startTime: dayjs.duration(0),
+          duration: dayjs.duration({ seconds: 30 }),
+          outputFormat: overrides.outputFormat ?? hlsFormat,
+          ptsOffset: 0,
+          realtime: true,
+          streamMode: 'hls',
+          copyVideo: overrides.copyVideo ?? true,
+          watermark: overrides.watermark,
+        },
+        lineupItem: makeLineupItem(),
+      });
+    }
+
+    function hi10pDetails(): StreamDetails {
+      const details = makeStreamDetails();
+      details.videoDetails![0] = {
+        ...details.videoDetails![0],
+        profile: 'High 10',
+        bitDepth: 10,
+        pixelFormat: 'yuv420p10le',
+      };
+      return details;
+    }
+
+    test('copies video and transcodes the selected audio track to AAC', async () => {
+      const {
+        sut,
+        getCapturedFrameState,
+        getCapturedFfmpegState,
+        getCapturedHwAccel,
+        getCapturedAudioInput,
+      } = makeSut({ config: { hardwareAccelerationMode: 'cuda' } });
+
+      const result = await run(sut);
+
+      const frameState = getCapturedFrameState()!;
+      expect(frameState.videoFormat).toBe(VideoFormats.Copy);
+      expect(frameState.deinterlace).toBe(false);
+      expect(frameState.videoBitrate).toBeNull();
+      expect(frameState.scaledSize.width).toBe(1920);
+      expect(frameState.scaledSize.height).toBe(1080);
+      expect(getCapturedHwAccel()).toBe('none');
+      // Not copy-all: one selected audio track goes through the transcode path.
+      expect(getCapturedFfmpegState()!.copyAllStreams).toBe(false);
+      const audioInput = getCapturedAudioInput()!;
+      expect(audioInput).toBeInstanceOf(AudioInputSource);
+      expect(audioInput.desiredState.audioEncoder).toBe(AudioFormats.Aac);
+      // Single variant, no alternate audio renditions in the master playlist.
+      expect(result!.renditions.audio).toEqual([]);
+    });
+
+    test('transcodes video when the session did not opt in', async () => {
+      const { sut, getCapturedFrameState } = makeSut();
+      await run(sut, { copyVideo: false });
+      expect(getCapturedFrameState()!.videoFormat).toBe(VideoFormats.H264);
+    });
+
+    test('transcodes video the client cannot play (Hi10P)', async () => {
+      const { sut, getCapturedFrameState } = makeSut({
+        config: { hardwareAccelerationMode: 'cuda' },
+      });
+      await run(sut, { details: hi10pDetails() });
+      expect(getCapturedFrameState()!.videoFormat).toBe(VideoFormats.H264);
+    });
+
+    test('transcodes video when a watermark must be drawn', async () => {
+      const { sut, getCapturedFrameState } = makeSut();
+      await run(sut, {
+        watermark: {
+          enabled: true,
+          url: 'http://example.com/logo.png',
+          width: 10,
+          verticalMargin: 0,
+          horizontalMargin: 0,
+          duration: 0,
+          position: 'bottom-right',
+          fixedSize: false,
+          animated: false,
+        } as Watermark,
+      });
+      expect(getCapturedFrameState()!.videoFormat).toBe(VideoFormats.H264);
+    });
+
+    test('transcodes video when an image subtitle must be burned in', async () => {
+      const { sut, getCapturedFrameState, getCapturedSubtitleInput } = makeSut({
+        subtitle: {
+          type: 'embedded',
+          codec: 'hdmv_pgs_subtitle',
+          index: 3,
+          default: false,
+          forced: false,
+          sdh: false,
+          languageCodeISO6392: 'eng',
+        },
+      });
+      await run(sut);
+      expect(getCapturedFrameState()!.videoFormat).toBe(VideoFormats.H264);
+      expect(getCapturedSubtitleInput()!.method).toBe(SubtitleMethods.Burn);
+    });
+
+    test('only applies to HLS output', async () => {
+      const { sut, getCapturedFrameState } = makeSut();
+      await run(sut, { outputFormat: MpegTsOutputFormat });
+      expect(getCapturedFrameState()!.videoFormat).toBe(VideoFormats.H264);
     });
   });
 
