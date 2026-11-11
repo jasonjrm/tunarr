@@ -614,6 +614,59 @@ describe('BasePipelineBuilder', () => {
     });
   });
 
+  describe('seek with copied video (-noaccurate_seek)', () => {
+    function build(opts: {
+      videoFormat?: 'copy' | 'h264';
+      copyAllStreams?: boolean;
+      start?: number;
+    }) {
+      return new NoopPipelineBuilder(
+        makeVideo(),
+        makeAudio(),
+        null,
+        null,
+        null,
+        EmptyFfmpegCapabilities,
+      )
+        .build(
+          FfmpegState.create({
+            version: state.version,
+            start: dayjs.duration(opts.start ?? 90_000),
+            copyAllStreams: opts.copyAllStreams ?? false,
+            outputFormat: HlsOutputFormat(defaultHlsOptions),
+          }),
+          new FrameState({
+            isAnamorphic: false,
+            paddedSize: FrameSize.FHD,
+            scaledSize: FrameSize.FHD,
+            videoFormat: opts.videoFormat ?? VideoFormats.Copy,
+            videoTrackTimescale: 90000,
+          }),
+          DefaultPipelineOptions,
+        )
+        .getCommandArgs();
+    }
+
+    test('copied video seeks without accurate seek, before the input', () => {
+      const args = build({});
+      const flag = args.indexOf('-noaccurate_seek');
+      expect(flag).toBeGreaterThan(-1);
+      expect(flag).toBeLessThan(args.indexOf('/path/to/video.mkv'));
+    });
+
+    test('transcoded video keeps accurate seek', () => {
+      expect(build({ videoFormat: 'h264' })).not.toContain('-noaccurate_seek');
+    });
+
+    test('copy-all passthrough keeps accurate seek', () => {
+      expect(build({ copyAllStreams: true })).not.toContain('-noaccurate_seek');
+    });
+
+    test('no seek, no flag', () => {
+      expect(build({ start: 0 })).not.toContain('-noaccurate_seek');
+    });
+  });
+
   describe('AV1 software decoder selection', () => {
     function buildAv1(binaryCapabilities: FfmpegCapabilities) {
       const av1Video = VideoInputSource.withStream(

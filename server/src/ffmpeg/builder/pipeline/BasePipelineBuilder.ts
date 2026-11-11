@@ -44,6 +44,7 @@ import { InfiniteLoopInputOption } from '@/ffmpeg/builder/options/input/Infinite
 import { ReadrateInputOption } from '@/ffmpeg/builder/options/input/ReadrateInputOption.js';
 import { SeekTimestampInputOption } from '@/ffmpeg/builder/options/input/SeekTimestampInputOption.js';
 import { StreamSeekInputOption } from '@/ffmpeg/builder/options/input/StreamSeekInputOption.js';
+import { NoAccurateSeekInputOption } from '@/ffmpeg/builder/options/input/NoAccurateSeekInputOption.js';
 import { UserAgentInputOption } from '@/ffmpeg/builder/options/input/UserAgentInputOption.js';
 import type { AudioState } from '@/ffmpeg/builder/state/AudioState.js';
 import type {
@@ -864,6 +865,18 @@ export abstract class BasePipelineBuilder implements PipelineBuilder {
       const option = new StreamSeekInputOption(this.ffmpegState.start);
       this.audioInputSource?.addOption(option);
       this.videoInputSource.addOption(option);
+
+      // Copied video starts on the keyframe before the seek point; let the
+      // re-encoded audio start there too instead of seconds later. Copy-all
+      // passthrough runs under -copyts and keeps the default.
+      if (
+        this.desiredState.videoFormat === VideoFormats.Copy &&
+        !this.ffmpegState.copyAllStreams
+      ) {
+        const noAccurateSeek = new NoAccurateSeekInputOption();
+        this.audioInputSource?.addOption(noAccurateSeek);
+        this.videoInputSource.addOption(noAccurateSeek);
+      }
 
       // hls_direct_v2 runs the whole process under -copyts, which keeps
       // the (un-seeked) subtitle output on the same absolute clock as the

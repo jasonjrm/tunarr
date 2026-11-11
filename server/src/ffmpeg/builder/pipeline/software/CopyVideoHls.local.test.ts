@@ -1,3 +1,5 @@
+import dayjs from 'dayjs';
+import duration from 'dayjs/plugin/duration.js';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
@@ -32,6 +34,8 @@ import {
 import { FrameState } from '../../state/FrameState.ts';
 import { FrameSize } from '../../types.ts';
 import { SoftwarePipelineBuilder } from './SoftwarePipelineBuilder.ts';
+
+dayjs.extend(duration);
 
 /**
  * Copy-or-transcode hybrid: copy the video, transcode one audio track to AAC,
@@ -73,6 +77,8 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
     streamBasePath: string;
     segmentNameFormat: string;
     ptsOffset?: number;
+    /** Seek into the source (ms), as when tuning in mid-program. */
+    startMs?: number;
     isFirstTranscode?: boolean;
     binaryCapabilities: FfmpegCapabilities;
     ffmpegVersion: FfmpegVersionResult;
@@ -124,6 +130,7 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
           streamNameFormat: 'stream.m3u8',
         }),
         ptsOffset: opts.ptsOffset ?? 0,
+        start: opts.startMs ? dayjs.duration(opts.startMs) : undefined,
         isFirstTranscode: opts.isFirstTranscode ?? true,
         emitEndList: true,
       }),
@@ -241,6 +248,59 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
       expect(second['video']).toBeLessThan(65);
       expect(second['audio']).toBeGreaterThanOrEqual(59);
       expect(second['audio']).toBeLessThan(65);
+    },
+  );
+
+  ffmpegTest(
+    'tuning in mid-program: audio starts with the copied video, not seconds later',
+    async ({ binaryCapabilities, ffmpegVersion }) => {
+      // 15 s source with a keyframe every 10 s (a long, Blu-ray-like GOP).
+      const source = path.join(workdir, 'long_gop.mkv');
+      const made = spawnSync(binaries!.ffmpeg, [
+        '-y',
+        '-stream_loop',
+        '5',
+        '-i',
+        Fixtures.video720p,
+        '-t',
+        '15',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-g',
+        '300',
+        '-keyint_min',
+        '300',
+        '-sc_threshold',
+        '0',
+        '-c:a',
+        'flac',
+        source,
+      ]);
+      expect(made.status, made.stderr?.toString()).toBe(0);
+
+      // Seek to 7 s: the copied video has to start at the 0 s keyframe.
+      const args = runHybrid({
+        source,
+        audioCodec: 'flac',
+        streamBasePath: 'copy_seek',
+        segmentNameFormat: 's%06d.ts',
+        startMs: 7000,
+        binaryCapabilities,
+        ffmpegVersion,
+      });
+      expect(args).toContain('-noaccurate_seek');
+
+      const dir = path.join(workdir, 'copy_seek');
+      const segment = readdirSync(dir)
+        .filter((f) => f.endsWith('.ts'))
+        .sort()[0];
+      const starts = streamStarts(path.join(dir, segment!));
+      expect(
+        Math.abs(starts['audio']! - starts['video']!),
+        JSON.stringify(starts),
+      ).toBeLessThan(0.5);
     },
   );
 });
