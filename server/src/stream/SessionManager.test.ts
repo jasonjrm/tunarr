@@ -827,6 +827,64 @@ describe('session cap and stale-session sweep', () => {
     expect(manager.getHlsSession(chA)).toBe(session);
   });
 
+  it('with too little free GPU memory, ends an idle session to start a new one', async () => {
+    vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
+    vi.stubEnv('TUNARR_SESSION_EVICT_IDLE_MS', '10000');
+    const manager = makeMultiChannelManager();
+    let freeVram = 4000;
+    manager.probeResources = () => Promise.resolve({ vramMb: freeVram, ramMb: 8000 });
+
+    const a = (await tune(manager, chA, 'a')).get();
+    await vi.advanceTimersByTimeAsync(15_000);
+    freeVram = 600;
+
+    const b = await tune(manager, chB, 'b');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(b.isSuccess()).toBe(true);
+    expect(a.stoppingOrStopped).toBe(true);
+    expect(manager.getHlsSession(chA)).toBeUndefined();
+  });
+
+  it('with too little free GPU memory and every session watched, refuses and says why', async () => {
+    vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
+    const manager = makeMultiChannelManager();
+    manager.probeResources = () => Promise.resolve({ vramMb: 600, ramMb: 8000 });
+
+    // Under the floor before anything runs: nothing to end, so refuse.
+    const a = await tune(manager, chA, 'a');
+    const { SessionCapacityError } = await import('@/types/errors.js');
+
+    expect(a.isFailure()).toBe(true);
+    expect(a.error).toBeInstanceOf(SessionCapacityError);
+    expect(a.error.message).toContain('600 MiB GPU memory free');
+  });
+
+  it('holds back GPU memory for streams that are still starting', async () => {
+    vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
+    vi.stubEnv('TUNARR_STREAM_VRAM_ESTIMATE_MB', '500');
+    const manager = makeMultiChannelManager();
+    manager.probeResources = () => Promise.resolve({ vramMb: 1000 });
+
+    const a = (await tune(manager, chA, 'a')).get();
+    (a as any).state = 'starting'; // hasn't allocated yet: 1000 free - 500 held < 700
+
+    const b = await tune(manager, chB, 'b');
+
+    expect(b.isFailure()).toBe(true);
+    expect(manager.getHlsSession(chA)).toBe(a);
+  });
+
+  it('starts sessions while there is room, and skips a probe that failed', async () => {
+    vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
+    vi.stubEnv('TUNARR_MIN_AVAILABLE_RAM_MB', '1500');
+    const manager = makeMultiChannelManager();
+    manager.probeResources = () => Promise.resolve({ ramMb: 6000 }); // no nvidia-smi
+
+    expect((await tune(manager, chA, 'a')).isSuccess()).toBe(true);
+    expect((await tune(manager, chB, 'b')).isSuccess()).toBe(true);
+  });
+
   it('the sweep cleans up an abandoned session without waiting for the cron', async () => {
     vi.stubEnv('TUNARR_SESSION_STALENESS_MS', '20000');
     vi.stubEnv('TUNARR_SESSION_CLEANUP_DELAY_SECONDS', '1');

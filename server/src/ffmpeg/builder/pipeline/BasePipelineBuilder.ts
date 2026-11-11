@@ -60,6 +60,7 @@ import type { DataProps, Nilable, Nullable } from '@/types/util.js';
 import { ifDefined, isNonEmptyString } from '@/util/index.js';
 import type { Logger } from '@/util/logging/LoggerFactory.js';
 import { LoggerFactory } from '@/util/logging/LoggerFactory.js';
+import { getNumericEnvVar, TUNARR_ENV_VARS } from '@/util/env.js';
 import { getTunarrVersion } from '@/util/version.js';
 import { filter, first, isNil, isNull, isUndefined, merge } from 'lodash-es';
 import path from 'node:path';
@@ -882,7 +883,11 @@ export abstract class BasePipelineBuilder implements PipelineBuilder {
   }
 
   protected setRealtime() {
-    const initialBurst = this.desiredState.realtime ? 0 : 60;
+    // How far ahead (seconds) a new stream reads at full speed before
+    // settling to realtime. Flipping channels starts one burst per tune-in.
+    const initialBurst = this.desiredState.realtime
+      ? 0
+      : (getNumericEnvVar(TUNARR_ENV_VARS.FFMPEG_INITIAL_BURST_SECONDS) ?? 60);
     const option = new ReadrateInputOption(
       this.ffmpegCapabilities,
       initialBurst,

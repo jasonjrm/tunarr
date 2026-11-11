@@ -31,6 +31,7 @@ import type {
   EtvNextSessionProvider,
 } from './etv/EtvNextSession.js';
 import { Session } from './Session.js';
+import { probeFreeResources, type FreeResources } from './StreamResources.js';
 import type { HlsSession, HlsSessionOptions } from './hls/HlsSession.js';
 import {
   type HlsSessionProvider,
@@ -63,6 +64,9 @@ export type SessionKey = `${string}_${SessionType}`;
 // two channels starting at once can't both take the last slot.
 const CapacityLockKey = '__session_capacity__';
 const DefaultEvictIdleMs = 10_000;
+// What a stream that is still starting will take once its ffmpeg allocates.
+const DefaultStreamVramEstimateMb = 500;
+const DefaultStreamRamEstimateMb = 300;
 
 const isConcatSessionType = (sessionType: string) =>
   (SessionConcatStreamModes as readonly string[]).includes(sessionType);
@@ -83,6 +87,8 @@ export class SessionManager {
   #sessionLocker = new MutexMap();
   #sessions: Record<SessionKey, Session> = {};
   #sweepTimer?: NodeJS.Timeout;
+  /** Replaced in tests. */
+  probeResources: () => Promise<FreeResources> = probeFreeResources;
 
   constructor(
     @inject(KEYS.ChannelDB) private channelDB: IChannelDB,
@@ -506,22 +512,24 @@ export class SessionManager {
   }
 
   /**
-   * Enforce TUNARR_MAX_SESSIONS before a new session starts. At the cap, end
-   * the session whose newest viewer heartbeat is oldest, provided it has been
-   * idle for at least TUNARR_SESSION_EVICT_IDLE_MS; if every session has a
-   * recent viewer, refuse the new one.
+   * Make room before a new session starts. There is no room when
+   * TUNARR_MAX_SESSIONS sessions are running, or when free GPU memory or
+   * available RAM is below TUNARR_MIN_FREE_VRAM_MB / TUNARR_MIN_AVAILABLE_RAM_MB
+   * (counting what streams that are still starting will take). Then end the
+   * session whose newest viewer heartbeat is oldest, provided it has been idle
+   * for at least TUNARR_SESSION_EVICT_IDLE_MS; if every session has a recent
+   * viewer, refuse the new one.
    */
   private async reclaimCapacity(channelId: string, sessionType: SessionType) {
-    const maxSessions = getNumericEnvVar(TUNARR_ENV_VARS.MAX_SESSIONS);
-    if (!maxSessions || maxSessions <= 0 || isConcatSessionType(sessionType)) {
+    if (isConcatSessionType(sessionType)) {
       return;
     }
-
     const active = filter(
       values(this.#sessions),
       (s) => !s.stoppingOrStopped && !isConcatSessionType(s.sessionType),
     );
-    if (active.length < maxSessions) {
+    const shortfall = await this.capacityShortfall(active);
+    if (!shortfall) {
       return;
     }
 
@@ -540,23 +548,58 @@ export class SessionManager {
 
     if (!victim) {
       this.logger.warn(
-        'At the %d-session cap and every session has a viewer; refusing %s on channel %s',
-        maxSessions,
+        'No room (%s) and every session has a viewer; refusing %s on channel %s',
+        shortfall,
         sessionType,
         channelId,
       );
-      throw new SessionCapacityError(maxSessions);
+      throw new SessionCapacityError(shortfall);
     }
 
     this.logger.info(
       this.getLoggerContext(victim.session.id),
-      'At the %d-session cap: ending a session idle for %dms to start %s on channel %s',
-      maxSessions,
+      'No room (%s): ending a session idle for %dms to start %s on channel %s',
+      shortfall,
       now - victim.lastSeen,
       sessionType,
       channelId,
     );
     await this.endSessionInBackground(victim.session);
+  }
+
+  /** Why another stream doesn't fit right now, or undefined if it does. */
+  private async capacityShortfall(active: Session[]): Promise<string | undefined> {
+    const maxSessions = getNumericEnvVar(TUNARR_ENV_VARS.MAX_SESSIONS) ?? 0;
+    if (maxSessions > 0 && active.length >= maxSessions) {
+      return `${active.length} of ${maxSessions} sessions running`;
+    }
+
+    const minVram = getNumericEnvVar(TUNARR_ENV_VARS.MIN_FREE_VRAM_MB) ?? 0;
+    const minRam = getNumericEnvVar(TUNARR_ENV_VARS.MIN_AVAILABLE_RAM_MB) ?? 0;
+    if (minVram <= 0 && minRam <= 0) {
+      return;
+    }
+
+    // Starting streams haven't allocated yet; hold back what they will take.
+    const starting = active.filter((s) => s.state === 'starting').length;
+    const free = await this.probeResources();
+    const vramNeed =
+      minVram +
+      starting *
+        (getNumericEnvVar(TUNARR_ENV_VARS.STREAM_VRAM_ESTIMATE_MB) ??
+          DefaultStreamVramEstimateMb);
+    if (minVram > 0 && free.vramMb !== undefined && free.vramMb < vramNeed) {
+      return `${free.vramMb} MiB GPU memory free, need ${vramNeed}`;
+    }
+    const ramNeed =
+      minRam +
+      starting *
+        (getNumericEnvVar(TUNARR_ENV_VARS.STREAM_RAM_ESTIMATE_MB) ??
+          DefaultStreamRamEstimateMb);
+    if (minRam > 0 && free.ramMb !== undefined && free.ramMb < ramNeed) {
+      return `${free.ramMb} MiB RAM available, need ${ramNeed}`;
+    }
+    return;
   }
 
   private addSession(id: string, sessionType: SessionType, session: Session) {

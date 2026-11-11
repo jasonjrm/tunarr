@@ -90,14 +90,12 @@ export class TranscodeConfigNotFoundError extends NotFoundError {
   }
 }
 
-// Every stream session slot (TUNARR_MAX_SESSIONS) is held by a session with an active viewer.
+// No room for another stream (TUNARR_MAX_SESSIONS, or free GPU memory / RAM below the
+// TUNARR_MIN_* floors) and every running session has an active viewer.
 export class SessionCapacityError extends TypedHttpError<503> {
   readonly type = 'session_capacity';
-  constructor(maxSessions: number) {
-    super(
-      503,
-      `All ${maxSessions} stream sessions are in use by active viewers`,
-    );
+  constructor(reason: string) {
+    super(503, `No capacity for another stream: ${reason}`);
   }
 }
 
