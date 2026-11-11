@@ -717,6 +717,15 @@ describe('session cap and stale-session sweep', () => {
     vi.useRealTimers();
   });
 
+  // Like a real HLS session: 'started' at once, first segments 3 s later.
+  class SlowStartSession extends StubHlsSession {
+    protected override async waitForStreamReady() {
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      const { Result } = await import('@/types/result.js');
+      return Result.success(void 0);
+    }
+  }
+
   it('does not limit sessions when TUNARR_MAX_SESSIONS is unset', async () => {
     const manager = makeMultiChannelManager();
     for (const id of [chA, chB, chC]) {
@@ -864,38 +873,62 @@ describe('session cap and stale-session sweep', () => {
     expect(a.error.message).toContain('600 MiB GPU memory free');
   });
 
-  it('holds back GPU memory for a session too new to have allocated', async () => {
+  it('holds back GPU memory for a session that is still starting', async () => {
     vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
     vi.stubEnv('TUNARR_STREAM_VRAM_ESTIMATE_MB', '500');
-    const manager = makeMultiChannelManager();
-    // The probe never sees A's memory: like two tune-ins a second apart.
+    const manager = makeMultiChannelManager(
+      (channel, options) =>
+        channel.uuid === chA
+          ? new SlowStartSession(channel, options)
+          : new StubHlsSession(channel, options),
+    );
+    // A's ffmpeg hasn't allocated, so the probe doesn't see it yet.
     manager.probeResources = () => Promise.resolve({ vramMb: 1000 });
 
-    const a = (await tune(manager, chA, 'a')).get();
-    expect(a.state).toBe('started'); // HLS sessions leave 'starting' at once
+    const pendingA = tune(manager, chA, 'a');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(manager.getHlsSession(chA)?.state).toBe('started'); // yet still starting
 
     const b = await tune(manager, chB, 'b'); // 1000 free - 500 held for A < 700
-
     expect(b.isFailure()).toBe(true);
-    expect(manager.getHlsSession(chA)).toBe(a);
 
-    // Once A is past the allocation grace, the probe is trusted again.
-    await vi.advanceTimersByTimeAsync(11_000);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect((await pendingA).isSuccess()).toBe(true);
+    // A is up (its memory is in the probe now): nothing held back.
     expect((await tune(manager, chB, 'b')).isSuccess()).toBe(true);
   });
 
-  it('never ends a session too new to have its viewer registered', async () => {
+  it('does not hold back memory for sessions that already started (no double count)', async () => {
+    vi.stubEnv('TUNARR_MIN_FREE_VRAM_MB', '700');
+    vi.stubEnv('TUNARR_STREAM_VRAM_ESTIMATE_MB', '500');
+    const manager = makeMultiChannelManager();
+    manager.probeResources = () => Promise.resolve({ vramMb: 1000 });
+
+    // Tune-ins one after another, each started before the next: like viewers
+    // tuning in a second apart. Each must see only the probe's 1000 free.
+    for (const [id, token] of [[chA, 'a'], [chB, 'b'], [chC, 'c']] as const) {
+      expect((await tune(manager, id, token)).isSuccess()).toBe(true);
+    }
+  });
+
+  it('never ends a session that is still starting', async () => {
     vi.stubEnv('TUNARR_MAX_SESSIONS', '1');
     vi.stubEnv('TUNARR_SESSION_EVICT_IDLE_MS', '0');
-    const manager = makeMultiChannelManager();
+    const manager = makeMultiChannelManager(
+      (channel, options) => new SlowStartSession(channel, options),
+    );
 
-    const a = (await tune(manager, chA, 'a')).get();
-    a.removeConnection('a'); // as if its viewer weren't registered yet
+    const pendingA = tune(manager, chA, 'a');
+    await vi.advanceTimersByTimeAsync(0);
+    const a = manager.getHlsSession(chA)!;
+    a.removeConnection('a'); // even with no viewer, a starting session is safe
 
-    const b = await tune(manager, chB, 'b');
+    const pendingB = tune(manager, chB, 'b');
+    await vi.advanceTimersByTimeAsync(3_000);
 
-    expect(b.isFailure()).toBe(true);
+    expect((await pendingB).isFailure()).toBe(true);
     expect(manager.getHlsSession(chA)).toBe(a);
+    await pendingA;
   });
 
   it('keeps ending idle sessions until the new one fits, waiting for each to stop', async () => {

@@ -67,11 +67,6 @@ const DefaultEvictIdleMs = 10_000;
 // What a new stream will take once its ffmpeg allocates.
 const DefaultStreamVramEstimateMb = 500;
 const DefaultStreamRamEstimateMb = 300;
-// HLS sessions report 'started' before ffmpeg has even spawned; it takes a
-// few seconds to allocate. Until then a probe doesn't see a new session's
-// memory, so admission holds back an estimate for it, and it can't be ended
-// to make room (its viewer may not be registered yet).
-const StreamAllocGraceMs = 10_000;
 // How long to wait for an ended session's ffmpeg to exit (and free its
 // memory) before checking for room again.
 const EvictionStopWaitMs = 5_000;
@@ -95,7 +90,11 @@ export class SessionManager {
   #sessionLocker = new MutexMap();
   #sessions: Record<SessionKey, Session> = {};
   #sweepTimer?: NodeJS.Timeout;
-  #createdAt = new WeakMap<Session, number>();
+  // Sessions whose start() has returned: their first segments exist, so their
+  // ffmpeg has allocated its memory. Until then (HLS sessions report 'started'
+  // before ffmpeg even spawns) a probe can't see a session's memory, so
+  // admission holds back an estimate for it, and it can't be ended to make room.
+  #ready = new WeakSet<Session>();
   /** Replaced in tests. */
   probeResources: () => Promise<FreeResources> = probeFreeResources;
 
@@ -392,7 +391,6 @@ export class SessionManager {
           session = await capacityLock.runExclusive(async () => {
             await this.reclaimCapacity(channelId, sessionType);
             const created = sessionFactory(channel);
-            this.#createdAt.set(created, dayjs().valueOf());
             this.addSession(channel.uuid, created.sessionType, created);
             // Registered before the lock is released, so the next admission
             // never sees this session with no viewer.
@@ -488,6 +486,9 @@ export class SessionManager {
 
         if (!session.started || session.hasError) {
           await session.start();
+          if (session.error === undefined) {
+            this.#ready.add(session);
+          }
           this.eventService.push({
             type: 'stream',
             action: 'start',
@@ -563,7 +564,7 @@ export class SessionManager {
             !ended.has(session) &&
             session.state !== 'starting' &&
             now - lastSeen >= idleMs &&
-            now - (this.#createdAt.get(session) ?? 0) >= StreamAllocGraceMs,
+            this.#ready.has(session),
         ),
         'lastSeen',
       );
@@ -614,13 +615,9 @@ export class SessionManager {
       return;
     }
 
-    // Sessions this new haven't allocated yet (see StreamAllocGraceMs); hold
-    // back what they will take. A session that allocated quickly is counted
-    // twice for a few seconds: errs toward refusing, never toward overfilling.
-    const now = dayjs().valueOf();
-    const starting = active.filter(
-      (s) => now - (this.#createdAt.get(s) ?? 0) < StreamAllocGraceMs,
-    ).length;
+    // Sessions still starting haven't allocated yet (see #ready); hold back
+    // what they will take.
+    const starting = active.filter((s) => !this.#ready.has(s)).length;
     const free = await this.probeResources();
     if (minVram > 0 && free.vramMb === undefined) {
       this.logger.warn('Free GPU memory probe failed (nvidia-smi); admitting without the VRAM check');
