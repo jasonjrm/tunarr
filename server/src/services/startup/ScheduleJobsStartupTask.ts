@@ -11,6 +11,8 @@ import { SubtitleExtractorTask } from '../../tasks/SubtitleExtractorTask.ts';
 import { SyncCollectionsTask } from '../../tasks/SyncCollectionsTask.ts';
 import { SyncCustomShowsTask } from '../../tasks/SyncCustomShowsTask.ts';
 import { UpdateXmlTvTask } from '../../tasks/UpdateXmlTvTask.ts';
+import { SessionManager } from '../../stream/SessionManager.ts';
+import { getNumericEnvVar, TUNARR_ENV_VARS } from '../../util/env.ts';
 import { autoFactoryKey, KEYS } from '../../types/inject.ts';
 import { InjectLogger } from '../../util/inject.ts';
 import type { Logger } from '../../util/logging/LoggerFactory.ts';
@@ -57,6 +59,11 @@ export class ScheduleJobsStartupTask extends SimpleStartupTask {
         undefined,
       ),
     );
+
+    const sweepMs = getNumericEnvVar(TUNARR_ENV_VARS.SESSION_SWEEP_INTERVAL_MS);
+    if (sweepMs && sweepMs > 0) {
+      container.get(SessionManager).startStaleSessionSweep(sweepMs);
+    }
 
     GlobalScheduler.scheduleTask(
       OnDemandChannelStateTask.ID,

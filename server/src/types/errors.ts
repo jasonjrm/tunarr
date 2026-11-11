@@ -90,9 +90,21 @@ export class TranscodeConfigNotFoundError extends NotFoundError {
   }
 }
 
+// Every stream session slot (TUNARR_MAX_SESSIONS) is held by a session with an active viewer.
+export class SessionCapacityError extends TypedHttpError<503> {
+  readonly type = 'session_capacity';
+  constructor(maxSessions: number) {
+    super(
+      503,
+      `All ${maxSessions} stream sessions are in use by active viewers`,
+    );
+  }
+}
+
 export type KnownErrorTypes =
   | 'channel_not_found'
   | 'generic_error'
+  | 'session_capacity'
   | 'transcode_config_not_found';
 
 export class GenericError extends TypedError {

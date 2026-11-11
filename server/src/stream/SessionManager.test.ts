@@ -669,3 +669,148 @@ describe('SessionManager', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// TUNARR_MAX_SESSIONS / TUNARR_SESSION_SWEEP_INTERVAL_MS
+// ---------------------------------------------------------------------------
+
+describe('session cap and stale-session sweep', () => {
+  const chA = '11111111-1111-1111-1111-111111111111';
+  const chB = '22222222-2222-2222-2222-222222222222';
+  const chC = '33333333-3333-3333-3333-333333333333';
+
+  // One manager whose channel lookups return a channel per id, so each id
+  // gets its own session.
+  function makeMultiChannelManager(
+    factory: (
+      channel: ChannelOrmWithTranscodeConfig,
+      options: HlsSessionOptions,
+    ) => StubHlsSession = (channel, options) =>
+      new StubHlsSession(channel, options),
+  ) {
+    const manager = makeSessionManager(factory);
+    (manager as any).channelDB.getChannelOrm = vi.fn((id: string) =>
+      Promise.resolve({
+        uuid: id,
+        number: 1,
+        transcodeConfig: {},
+      } as unknown as ChannelOrmWithTranscodeConfig),
+    );
+    return manager;
+  }
+
+  const tune = (
+    manager: InstanceType<typeof SessionManager>,
+    channelId: string,
+    token: string,
+  ) =>
+    manager.getOrCreateHlsSession(channelId, token, connection, {
+      streamMode: 'hls',
+    });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.useRealTimers();
+  });
+
+  it('does not limit sessions when TUNARR_MAX_SESSIONS is unset', async () => {
+    const manager = makeMultiChannelManager();
+    for (const id of [chA, chB, chC]) {
+      expect((await tune(manager, id, `viewer-${id}`)).isSuccess()).toBe(true);
+    }
+    expect(Object.keys(manager.allSessions())).toHaveLength(3);
+  });
+
+  it('allows sessions up to the cap', async () => {
+    vi.stubEnv('TUNARR_MAX_SESSIONS', '2');
+    const manager = makeMultiChannelManager();
+    expect((await tune(manager, chA, 'a')).isSuccess()).toBe(true);
+    expect((await tune(manager, chB, 'b')).isSuccess()).toBe(true);
+    expect(Object.keys(manager.allSessions())).toHaveLength(2);
+  });
+
+  it('at the cap, ends the session idle the longest to start a new one', async () => {
+    vi.stubEnv('TUNARR_MAX_SESSIONS', '2');
+    vi.stubEnv('TUNARR_SESSION_EVICT_IDLE_MS', '10000');
+    const manager = makeMultiChannelManager();
+
+    const a = (await tune(manager, chA, 'a')).get();
+    await vi.advanceTimersByTimeAsync(5_000);
+    const b = (await tune(manager, chB, 'b')).get();
+    // A's viewer flipped away 15s ago; B's is still watching.
+    await vi.advanceTimersByTimeAsync(10_000);
+    b.recordHeartbeat('b');
+
+    const c = await tune(manager, chC, 'c');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(c.isSuccess()).toBe(true);
+    expect(manager.getHlsSession(chA)).toBeUndefined();
+    expect(a.stoppingOrStopped).toBe(true);
+    expect(manager.getHlsSession(chB)).toBe(b);
+    expect(Object.keys(manager.allSessions())).toHaveLength(2);
+  });
+
+  it('refuses a new session when every session has a recent viewer', async () => {
+    vi.stubEnv('TUNARR_MAX_SESSIONS', '2');
+    vi.stubEnv('TUNARR_SESSION_EVICT_IDLE_MS', '10000');
+    const manager = makeMultiChannelManager();
+
+    const a = (await tune(manager, chA, 'a')).get();
+    const b = (await tune(manager, chB, 'b')).get();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const c = await tune(manager, chC, 'c');
+    const { SessionCapacityError } = await import('@/types/errors.js');
+
+    expect(c.isFailure()).toBe(true);
+    expect(c.error).toBeInstanceOf(SessionCapacityError);
+    expect(manager.getHlsSession(chA)).toBe(a);
+    expect(manager.getHlsSession(chB)).toBe(b);
+    expect(manager.getHlsSession(chC)).toBeUndefined();
+  });
+
+  it('a new viewer on a channel that already has a session does not count against the cap', async () => {
+    vi.stubEnv('TUNARR_MAX_SESSIONS', '1');
+    const manager = makeMultiChannelManager();
+
+    const first = (await tune(manager, chA, 'a')).get();
+    const second = await tune(manager, chA, 'second-viewer');
+
+    expect(second.isSuccess()).toBe(true);
+    expect(second.get()).toBe(first);
+  });
+
+  it('never ends a session that is still starting', async () => {
+    vi.stubEnv('TUNARR_MAX_SESSIONS', '1');
+    vi.stubEnv('TUNARR_SESSION_EVICT_IDLE_MS', '0');
+    const manager = makeMultiChannelManager();
+
+    const a = (await tune(manager, chA, 'a')).get();
+    (a as any).state = 'starting';
+
+    const b = await tune(manager, chB, 'b');
+
+    expect(b.isFailure()).toBe(true);
+    expect(manager.getHlsSession(chA)).toBe(a);
+  });
+
+  it('the sweep cleans up an abandoned session without waiting for the cron', async () => {
+    vi.stubEnv('TUNARR_SESSION_STALENESS_MS', '20000');
+    vi.stubEnv('TUNARR_SESSION_CLEANUP_DELAY_SECONDS', '1');
+    const manager = makeMultiChannelManager();
+    manager.startStaleSessionSweep(5_000);
+
+    const a = (await tune(manager, chA, 'a')).get();
+    expect(manager.getHlsSession(chA)).toBe(a);
+
+    // 20s staleness + up to one 5s sweep + 1s cleanup delay
+    await vi.advanceTimersByTimeAsync(27_000);
+
+    expect(manager.getHlsSession(chA)).toBeUndefined();
+  });
+});

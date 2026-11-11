@@ -9,11 +9,18 @@ import {
   isEmpty,
   isNil,
   isUndefined,
+  keys,
+  max,
   maxBy,
+  minBy,
   omitBy,
   values,
 } from 'lodash-es';
-import { ChannelNotFoundError, TypedError } from '../types/errors.js';
+import {
+  ChannelNotFoundError,
+  SessionCapacityError,
+  TypedError,
+} from '../types/errors.js';
 import {
   type ConcatSessionFactory,
   type ConcatSessionOptions,
@@ -52,12 +59,30 @@ import type { BaseHlsSessionOptions } from './hls/BaseHlsSession.ts';
 
 export type SessionKey = `${string}_${SessionType}`;
 
+// Held while checking TUNARR_MAX_SESSIONS and registering a new session, so
+// two channels starting at once can't both take the last slot.
+const CapacityLockKey = '__session_capacity__';
+const DefaultEvictIdleMs = 10_000;
+
+const isConcatSessionType = (sessionType: string) =>
+  (SessionConcatStreamModes as readonly string[]).includes(sessionType);
+
+// Newest heartbeat across all of a session's viewers; 0 when it has none.
+// Heartbeats are kept apart from the connection details, so read them by token.
+const newestHeartbeat = (session: Session) =>
+  max(
+    keys(session.connections()).map(
+      (token) => session.lastHeartbeat(token) ?? 0,
+    ),
+  ) ?? 0;
+
 @injectable()
 export class SessionManager {
   @InjectLogger() declare private readonly logger: Logger;
 
   #sessionLocker = new MutexMap();
   #sessions: Record<SessionKey, Session> = {};
+  #sweepTimer?: NodeJS.Timeout;
 
   constructor(
     @inject(KEYS.ChannelDB) private channelDB: IChannelDB,
@@ -185,6 +210,17 @@ export class SessionManager {
       delete this.#sessions[sessionCacheKey(id, sessionType)];
       return session;
     });
+  }
+
+  /**
+   * Run {@link cleanupStaleSessions} every `intervalMs`, so a session whose
+   * viewers left is cleaned up within seconds instead of on the next
+   * one-minute cron run.
+   */
+  startStaleSessionSweep(intervalMs: number) {
+    clearInterval(this.#sweepTimer);
+    this.#sweepTimer = setInterval(() => this.cleanupStaleSessions(), intervalMs);
+    this.#sweepTimer.unref();
   }
 
   cleanupStaleSessions() {
@@ -336,9 +372,14 @@ export class SessionManager {
             throw new ChannelNotFoundError(channelId);
           }
 
-          session = sessionFactory(channel);
-
-          this.addSession(channel.uuid, session.sessionType, session);
+          const capacityLock =
+            await this.#sessionLocker.getOrCreateLock(CapacityLockKey);
+          session = await capacityLock.runExclusive(async () => {
+            await this.reclaimCapacity(channelId, sessionType);
+            const created = sessionFactory(channel);
+            this.addSession(channel.uuid, created.sessionType, created);
+            return created;
+          });
 
           session.on('error', (e) => {
             this.logger.error(
@@ -458,6 +499,60 @@ export class SessionManager {
     } catch (e) {
       return Result.failure(TypedError.fromAny(e));
     }
+  }
+
+  /**
+   * Enforce TUNARR_MAX_SESSIONS before a new session starts. At the cap, end
+   * the session whose newest viewer heartbeat is oldest, provided it has been
+   * idle for at least TUNARR_SESSION_EVICT_IDLE_MS; if every session has a
+   * recent viewer, refuse the new one.
+   */
+  private async reclaimCapacity(channelId: string, sessionType: SessionType) {
+    const maxSessions = getNumericEnvVar(TUNARR_ENV_VARS.MAX_SESSIONS);
+    if (!maxSessions || maxSessions <= 0 || isConcatSessionType(sessionType)) {
+      return;
+    }
+
+    const active = filter(
+      values(this.#sessions),
+      (s) => !s.stoppingOrStopped && !isConcatSessionType(s.sessionType),
+    );
+    if (active.length < maxSessions) {
+      return;
+    }
+
+    const idleMs =
+      getNumericEnvVar(TUNARR_ENV_VARS.SESSION_EVICT_IDLE_MS) ??
+      DefaultEvictIdleMs;
+    const now = dayjs().valueOf();
+    const victim = minBy(
+      filter(
+        active.map((session) => ({ session, lastSeen: newestHeartbeat(session) })),
+        ({ session, lastSeen }) =>
+          session.state !== 'starting' && now - lastSeen >= idleMs,
+      ),
+      'lastSeen',
+    );
+
+    if (!victim) {
+      this.logger.warn(
+        'At the %d-session cap and every session has a viewer; refusing %s on channel %s',
+        maxSessions,
+        sessionType,
+        channelId,
+      );
+      throw new SessionCapacityError(maxSessions);
+    }
+
+    this.logger.info(
+      this.getLoggerContext(victim.session.id),
+      'At the %d-session cap: ending a session idle for %dms to start %s on channel %s',
+      maxSessions,
+      now - victim.lastSeen,
+      sessionType,
+      channelId,
+    );
+    await this.endSessionInBackground(victim.session);
   }
 
   private addSession(id: string, sessionType: SessionType, session: Session) {

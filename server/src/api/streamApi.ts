@@ -1,4 +1,5 @@
 import type { ChannelOrm } from '@/db/schema/Channel.js';
+import { SessionCapacityError } from '../types/errors.js';
 import type { BaseHlsSession } from '@/stream/hls/BaseHlsSession.js';
 import { HlsPlaylistCreator } from '@/stream/hls/HlsPlaylistCreator.js';
 import type { HlsSession } from '@/stream/hls/HlsSession.js';
@@ -179,6 +180,9 @@ export const streamApi: RouterPluginAsyncCallback = async (fastify) => {
           )
           .with('generic_error', () =>
             res.status(500).send('Unable to start session'),
+          )
+          .with('session_capacity', () =>
+            res.status(503).send('All tuners are busy.'),
           )
           .with('transcode_config_not_found', () =>
             res.status(404).send('Transcode config not found'),
@@ -633,6 +637,9 @@ export const streamApi: RouterPluginAsyncCallback = async (fastify) => {
 
       if (sessionResult.isFailure()) {
         logger.error(sessionResult.error);
+        if (sessionResult.error instanceof SessionCapacityError) {
+          return res.status(503).send('All tuners are busy.');
+        }
       }
 
       return sessionResult.getOrElse(() => {
