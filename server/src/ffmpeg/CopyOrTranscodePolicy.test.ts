@@ -213,6 +213,14 @@ describe('decideCopyOrTranscode', () => {
     );
   });
 
+  test.each(['yuv422p', 'yuv444p', 'yuv422p10le'])(
+    '%s chroma transcodes even without a reported profile',
+    (pixelFormat) => {
+      const d = decide({ video: video({ profile: undefined, pixelFormat }) });
+      expect(d.video).toBe('transcode');
+    },
+  );
+
   test('unknown profile is let through', () => {
     expect(decide({ video: video({ profile: undefined }) }).video).toBe('copy');
   });

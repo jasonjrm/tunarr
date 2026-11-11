@@ -180,6 +180,12 @@ function videoTranscodeReasons(input: CopyOrTranscodeInput): string[] {
     if (codecProfile && !supported.profiles.includes(codecProfile)) {
       reasons.push(`video: ${codec} profile "${codecProfile}" not supported`);
     }
+    // Android decoders only promise 4:2:0. A 4:2:2/4:4:4 source normally shows
+    // in the profile too, but not every source reports one.
+    const pix = (video.pixelFormat ?? '').toLowerCase();
+    if (/(422|444)/.test(pix)) {
+      reasons.push(`video: ${codec} ${pix} chroma not supported`);
+    }
     const bitDepth = video.bitDepth ?? bitDepthFromPixelFormat(video);
     if (bitDepth && bitDepth > supported.maxBitDepth) {
       reasons.push(`video: ${codec} ${bitDepth}-bit not supported`);
