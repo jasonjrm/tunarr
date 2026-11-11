@@ -562,6 +562,181 @@ describe('HlsSession', () => {
   });
 });
 
+describe('copied-video fallback (CT-4)', () => {
+  let tmpDir: tmp.DirResult;
+  const savedEnv = process.env.TUNARR_COPY_VIDEO_CHANNELS;
+
+  beforeEach(() => {
+    tmpDir = tmp.dirSync({ unsafeCleanup: true });
+    process.env.TUNARR_COPY_VIDEO_CHANNELS = '989';
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    tmpDir.removeCallback();
+    if (savedEnv === undefined) {
+      delete process.env.TUNARR_COPY_VIDEO_CHANNELS;
+    } else {
+      process.env.TUNARR_COPY_VIDEO_CHANNELS = savedEnv;
+    }
+  });
+
+  type Run = { copiedVideo: boolean; exitCode: number };
+
+  /**
+   * Drive the real session loop over one 50-second program (short, so the
+   * loop's 60 s buffer check asks for the next program at once). Each entry in
+   * `runs` is one ffmpeg run of it; `writtenTicks[i]` is the PTS offset the
+   * session reads after run i (90 kHz ticks).
+   */
+  async function play(runs: Run[], writtenTicks: number[]) {
+    // The first program of a session starts at 0 without reading an offset.
+    const ptsOffsets = [...writtenTicks];
+    vi.spyOn(
+      HlsSession.prototype as unknown as {
+        getPtsOffset(): Promise<number>;
+      },
+      'getPtsOffset',
+    ).mockImplementation(() => Promise.resolve(ptsOffsets.shift() ?? 0));
+    vi.spyOn(MeasureAudioEncoderLeadTask.prototype, 'run').mockResolvedValue(
+      Result.success(0),
+    );
+
+    const requests: { copyVideo?: boolean }[] = [];
+    const lineupStarts: number[] = [];
+    let session: HlsSession;
+    let call = 0;
+
+    const factory = (
+      _ctx: PlayerContext,
+      _fmt: OutputFormat,
+      opts?: { copyVideo?: boolean },
+    ) => {
+      requests.push({ copyVideo: opts?.copyVideo });
+      const run = runs[Math.min(call++, runs.length - 1)]!;
+      const transcodeSession = {
+        streamDuration: dayjs.duration(50, 'seconds'),
+        kill: vi.fn(),
+        wait: vi.fn(async () => {
+          if (call >= runs.length) {
+            // Last run: end the test session instead of looping forever.
+            await session.stop({ waitForExit: false });
+          }
+          return { code: run.exitCode, signal: null };
+        }),
+        exited: Promise.resolve(),
+      };
+      return {
+        on: vi.fn(),
+        setup: vi.fn(() => Promise.resolve(Result.success(transcodeSession))),
+        start: vi.fn(() => Promise.resolve()),
+        renditions: undefined,
+        copiedVideo: run.copiedVideo,
+        transcodeSession,
+      } as unknown as ProgramStream;
+    };
+
+    session = new HlsSession(
+      {
+        uuid: channelUuid,
+        number: 989,
+        transcodeConfig: {},
+      } as ChannelOrmWithTranscodeConfig,
+      {
+        streamMode: 'hls',
+        initialSegmentCount: 2,
+        transcodeDirectory: tmpDir.name,
+      },
+      {
+        getCurrentLineupItem: vi.fn((req: { startTime: number }) => {
+          lineupStarts.push(req.startTime);
+          return Promise.resolve(
+            Result.success({
+              lineupItem: {
+                type: 'program',
+                streamDuration: 50_000,
+                duration: 50_000,
+                program: { uuid: 'program-1' },
+              },
+              channelContext: {},
+              sourceChannel: {},
+            }),
+          );
+        }),
+      } as unknown as StreamProgramCalculator,
+      {} as ISettingsDB,
+      {
+        getLiveTimestamp: vi.fn((_id: string, ts: number) =>
+          Promise.resolve(ts),
+        ),
+      } as unknown as OnDemandChannelService,
+      factory as unknown as (
+        ctx: PlayerContext,
+        fmt: OutputFormat,
+      ) => ProgramStream,
+    );
+
+    await (
+      session as unknown as { startInternal(): Promise<void> }
+    ).startInternal();
+    await vi.waitFor(() => expect(session.state).toBe('stopped'));
+    return { requests, lineupStarts };
+  }
+
+  test('a failed copied program is replayed from where it stopped, as a full transcode', async () => {
+    const { requests, lineupStarts } = await play(
+      [
+        { copiedVideo: true, exitCode: 1 },
+        { copiedVideo: false, exitCode: 0 },
+      ],
+      [10 * 90_000, 0],
+    );
+
+    expect(requests.map((r) => r.copyVideo)).toEqual([true, false]);
+    // The retry starts 10 s into the program, not after its 50.
+    expect(lineupStarts[1]! - lineupStarts[0]!).toBe(10_000);
+  });
+
+  test('a copied program that ended well short of its length, even with code 0, is retried', async () => {
+    const { requests, lineupStarts } = await play(
+      [
+        { copiedVideo: true, exitCode: 0 },
+        { copiedVideo: false, exitCode: 0 },
+      ],
+      [20 * 90_000, 0],
+    );
+
+    expect(requests.map((r) => r.copyVideo)).toEqual([true, false]);
+    expect(lineupStarts[1]! - lineupStarts[0]!).toBe(20_000);
+  });
+
+  test('a copied program that played to its end moves on normally', async () => {
+    const { requests, lineupStarts } = await play(
+      [
+        { copiedVideo: true, exitCode: 0 },
+        { copiedVideo: true, exitCode: 0 },
+      ],
+      [50 * 90_000, 0],
+    );
+
+    expect(requests.map((r) => r.copyVideo)).toEqual([true, true]);
+    expect(lineupStarts[1]! - lineupStarts[0]!).toBe(50_000);
+  });
+
+  test('a failed transcoded program is not retried here (it keeps the error screen path)', async () => {
+    const { requests, lineupStarts } = await play(
+      [
+        { copiedVideo: false, exitCode: 1 },
+        { copiedVideo: false, exitCode: 0 },
+      ],
+      [10 * 90_000, 0],
+    );
+
+    expect(requests.map((r) => r.copyVideo)).toEqual([true, true]);
+    expect(lineupStarts[1]! - lineupStarts[0]!).toBe(50_000);
+  });
+});
+
 describe('nextProgramPtsOffset', () => {
   test('starts the next audio where the previous audio ended', () => {
     // Audio ends 360 ticks after video, and AAC places its first packet 1920

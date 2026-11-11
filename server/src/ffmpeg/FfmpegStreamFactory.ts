@@ -538,6 +538,7 @@ export class FfmpegStreamFactory {
         subtitleRendition,
         isPassthrough,
       ),
+      copiedVideo: copyVideo,
     };
   }
 

@@ -20,6 +20,7 @@ import type {
 } from '@/stream/types.js';
 import { Result } from '@/types/result.js';
 import type { Maybe } from '@/types/util.js';
+import { isContentBackedLineupItem } from '@/db/derived_types/StreamLineup.js';
 import { isCopyVideoChannel } from '@/util/copyVideoChannels.js';
 import { fileExists } from '@/util/fsUtil.js';
 import { wait } from '@/util/index.js';
@@ -66,6 +67,10 @@ export interface HlsSessionOptions extends BaseHlsSessionOptions {
  * Initializes an ffmpeg process that concatenates via the /playlist
  * endpoint and outputs an HLS format + segments
  */
+// A copied program that ends more than this far short of its length, even
+// with exit code 0, is treated as failed (TODO CT-4).
+const CopyFallbackShortfallMs = 10_000;
+
 export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   #playlistStart?: Dayjs;
   #hlsPlaylistMutator: HlsPlaylistMutator = new HlsPlaylistMutator();
@@ -88,6 +93,9 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   // Taken once, here: a live-config edit applies to the next session, never to
   // one that is already streaming, and every program in this session agrees.
   readonly #copyVideo: boolean;
+  // Programs whose copied video failed in this session. They are retried, and
+  // replayed later in the session, as a full transcode.
+  readonly #copyVideoFailed = new Set<string>();
 
   constructor(
     channel: ChannelOrmWithTranscodeConfig,
@@ -414,10 +422,15 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         },
       );
 
+      // Offline and error items have no program, and never copy video.
+      const programId = isContentBackedLineupItem(result.lineupItem)
+        ? result.lineupItem.program.uuid
+        : undefined;
       let programStream = this.getProgramStream(
         context,
         ptsOffset,
         subtitleSegmentStartNumber,
+        programId === undefined || !this.#copyVideoFailed.has(programId),
       );
 
       programStream.on('error', () => {
@@ -465,8 +478,9 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         return;
       }
 
+      const programStart = this.transcodedUntil ?? dayjs();
       transcodeSessionResult.forEach((transcodeSession) => {
-        this.transcodedUntil = (this.transcodedUntil ?? dayjs()).add(
+        this.transcodedUntil = programStart.add(
           transcodeSession.streamDuration,
         );
         this.#currentSession = transcodeSession;
@@ -478,7 +492,16 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         // await this.trimPlaylistAndDeleteSegments();
       }
       await programStream.start();
-      return programStream.transcodeSession!.wait();
+      const exit = await programStream.transcodeSession!.wait();
+      if (programStream.copiedVideo && programId !== undefined) {
+        await this.fallBackIfCopyFailed(
+          programId,
+          exit.code,
+          programStart,
+          ptsOffset,
+        );
+      }
+      return exit;
     });
 
     if (transcodeResult.isFailure()) {
@@ -489,6 +512,42 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     }
 
     this.logger.debug('Stream ended.');
+  }
+
+  /**
+   * A copied-video program whose ffmpeg failed, or ended well short of its
+   * length, is played again from where its output stopped, as a full
+   * transcode: rewind the schedule position to what was actually written and
+   * let the main loop pick the same program up there.
+   */
+  private async fallBackIfCopyFailed(
+    programId: string,
+    exitCode: number | null,
+    programStart: Dayjs,
+    ptsOffset: number,
+  ) {
+    if (this.state !== 'started') {
+      return; // stopped or killed by us
+    }
+    const expectedMs = dayjs(this.transcodedUntil).diff(programStart);
+    const writtenMs = Math.max(
+      0,
+      ((await this.getPtsOffset()) - ptsOffset) / 90,
+    );
+    const shortMs = expectedMs - writtenMs;
+    if (exitCode === 0 && shortMs <= CopyFallbackShortfallMs) {
+      return;
+    }
+    this.#copyVideoFailed.add(programId);
+    this.transcodedUntil = programStart.add(Math.min(writtenMs, expectedMs));
+    this.logger.warn(
+      'Channel %d program %s: copied video ended after %ds of %ds (exit code %s); retrying the rest as a full transcode',
+      this.channel.number,
+      programId,
+      Math.round(writtenMs / 1000),
+      Math.round(expectedMs / 1000),
+      exitCode ?? 'none',
+    );
   }
 
   protected override getAdditionalRequiredFiles(): string[] {
@@ -517,6 +576,7 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     context: PlayerContext,
     ptsOffset: Maybe<number>,
     subtitleSegmentStartNumber: Maybe<number>,
+    allowCopyVideo: boolean = true,
   ) {
     const hlsOptions = this.getHlsOptions();
 
@@ -529,7 +589,7 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       ptsOffset,
       isFirstTranscode: this.#isFirstTranscode,
       subtitleSegmentStartNumber,
-      copyVideo: this.#copyVideo,
+      copyVideo: this.#copyVideo && allowCopyVideo,
     });
   }
 

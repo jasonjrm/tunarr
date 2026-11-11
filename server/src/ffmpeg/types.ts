@@ -16,6 +16,11 @@ import type { FfmpegTranscodeSession } from './FfmpegTrancodeSession.ts';
 export type TranscodeSessionResult = {
   session: FfmpegTranscodeSession;
   renditions: StreamRenditions;
+  /**
+   * The copy-or-transcode policy chose to copy this program's video on the
+   * transcode path. Copy-all passthrough does not set it.
+   */
+  copiedVideo?: boolean;
 };
 
 export type ConcatOptions = {

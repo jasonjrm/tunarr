@@ -46,6 +46,7 @@ export class ProgramStream extends events.EventEmitter<ProgramStreamEvents> {
   private hadError: boolean = false;
   private _transcodeSession: Maybe<FfmpegTranscodeSession>;
   private _renditions?: StreamRenditions;
+  private _copiedVideo = false;
 
   constructor(
     @injected(KEYS.SettingsDB) protected settingsDB: ISettingsDB,
@@ -78,6 +79,7 @@ export class ProgramStream extends events.EventEmitter<ProgramStreamEvents> {
     result.forEach((value) => {
       this.transcodeSession = value.session;
       this._renditions = value.renditions;
+      this._copiedVideo = value.copiedVideo ?? false;
     });
 
     return result.map((r) => r.session);
@@ -267,6 +269,11 @@ export class ProgramStream extends events.EventEmitter<ProgramStreamEvents> {
 
   protected shutdownInternal(): void {}
 
+  /** This program copies its video (copy-or-transcode policy). */
+  get copiedVideo(): boolean {
+    return this._copiedVideo;
+  }
+
   get renditions(): StreamRenditions | undefined {
     return this._renditions;
   }
@@ -288,7 +295,9 @@ export class ProgramStream extends events.EventEmitter<ProgramStreamEvents> {
         this.hadError = true;
         const failedStream = this._transcodeSession;
         failedStream?.kill();
-        if (!this.opts?.disableErrorStream) {
+        // A failed copied-video program is retried as a full transcode by
+        // the HLS session, so it gets no error screen here.
+        if (!this.opts?.disableErrorStream && !this._copiedVideo) {
           this.tryReplaceWithErrorStream(this.outStream).catch((e) => {
             this.logger.error(e, 'Error while setting up ');
           });
