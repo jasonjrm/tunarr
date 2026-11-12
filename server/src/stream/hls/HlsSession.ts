@@ -101,6 +101,10 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   // Programs whose copied video failed in this session. They are retried, and
   // replayed later in the session, as a full transcode.
   readonly #copyVideoFailed = new Set<string>();
+  // EXT-X-TARGETDURATION must be at least the longest segment, and must not
+  // change during a session. Copied video is cut on the source's keyframes,
+  // so its segments can run past hlsTime: keep the largest seen.
+  #targetDuration: number | undefined;
 
   constructor(
     channel: ChannelOrmWithTranscodeConfig,
@@ -158,13 +162,23 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       return await this.lock.runExclusive(async () => {
         const playlistLines = await this.readPlaylist();
         if (playlistLines) {
+          let target = this.#targetDuration ?? this.getHlsOptions().hlsTime;
+          for (const line of playlistLines) {
+            if (line.startsWith('#EXTINF:')) {
+              const seconds = parseFloat(line.slice('#EXTINF:'.length));
+              if (Number.isFinite(seconds)) {
+                target = Math.max(target, Math.ceil(seconds));
+              }
+            }
+          }
+          this.#targetDuration = target;
           const trimResult = this.#hlsPlaylistMutator.trimPlaylist(
             this.#playlistStart!,
             filterOpts,
             playlistLines,
             {
               maxSegmentsToKeep: 20,
-              targetDuration: this.getHlsOptions().hlsTime,
+              targetDuration: target,
               previousDiscontinuitySequence: this.#lastDiscontinuitySequence,
               endWithDiscontinuity: false,
             },

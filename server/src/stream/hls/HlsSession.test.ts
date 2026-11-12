@@ -316,6 +316,68 @@ describe('HlsSession', () => {
     });
   });
 
+  describe('target duration with copied video', () => {
+    let dir: tmp.DirResult;
+    beforeEach(() => {
+      dir = tmp.dirSync({ unsafeCleanup: true });
+    });
+    afterEach(() => {
+      dir.removeCallback();
+    });
+
+    async function serve(session: HlsSession, durations: number[]) {
+      const lines = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:6',
+        '#EXT-X-TARGETDURATION:4',
+        '#EXT-X-MEDIA-SEQUENCE:0',
+      ];
+      durations.forEach((d, i) => {
+        const name = `data${String(i).padStart(6, '0')}.ts`;
+        lines.push(
+          `#EXTINF:${d.toFixed(6)},`,
+          '#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00.000+0000',
+          name,
+        );
+      });
+      await fs.writeFile(
+        path.join(session.workingDirectory, 'stream.m3u8'),
+        lines.join('\n'),
+      );
+      for (const [i] of durations.entries()) {
+        await fs.writeFile(
+          path.join(
+            session.workingDirectory,
+            `data${String(i).padStart(6, '0')}.ts`,
+          ),
+          '',
+        );
+      }
+      return (await session.trimPlaylist()).get()?.playlist ?? '';
+    }
+
+    test('covers the longest segment and never shrinks within the session', async () => {
+      const session = makeSession(dir.name);
+      await (
+        session as unknown as { startInternal(): Promise<void> }
+      ).startInternal();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await fs.mkdir(session.workingDirectory, { recursive: true });
+
+      expect(await serve(session, [4, 4, 4])).toContain(
+        '#EXT-X-TARGETDURATION:4\n',
+      );
+      // A copied program cut on 7.6 s keyframes.
+      expect(await serve(session, [4, 4, 7.633])).toContain(
+        '#EXT-X-TARGETDURATION:8\n',
+      );
+      // Back to 4 s segments: stays 8 (the tag must not change in a session).
+      expect(await serve(session, [4, 4, 4])).toContain(
+        '#EXT-X-TARGETDURATION:8\n',
+      );
+    });
+  });
+
   describe('audio encoder lead prefetch', () => {
     let dir: tmp.DirResult;
 
