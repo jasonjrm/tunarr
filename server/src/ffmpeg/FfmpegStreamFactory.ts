@@ -53,6 +53,8 @@ import type { FfmpegPlaybackParams } from './FfmpegPlaybackParamsCalculator.ts';
 import { FfmpegPlaybackParamsCalculator } from './FfmpegPlaybackParamsCalculator.ts';
 import { FfmpegProcess } from './FfmpegProcess.ts';
 import { FfmpegTranscodeSession } from './FfmpegTrancodeSession.ts';
+import { dialogueAssFile } from '../stream/assDialogue.ts';
+import { SubtitleStreamPicker } from './SubtitleStreamPicker.ts';
 import { StreamSelector } from './StreamSelector.ts';
 import {
   decideCopyOrTranscode,
@@ -114,6 +116,7 @@ import type {
 import { ConcatStreamModeRemuxes } from './types.ts';
 import { FfmpegInfo } from './ffmpegInfo.ts';
 
+const AssCodecs = new Set(['ass', 'ssa']);
 const SoundtrackProbeTimeoutMs = 10_000;
 
 @injectable()
@@ -605,7 +608,7 @@ export class FfmpegStreamFactory {
       // Image subtitles (PGS, VobSub) are never shown in this fork: they can
       // only be burned in, which would ignore the viewer's CC choice and force
       // a video transcode. Text subtitles go out as the WebVTT sidecar.
-      const subtitleStream =
+      let subtitleStream: Maybe<SubtitleStreamDetails> | null =
         pickedSubtitle && isImageBasedSubtitle(pickedSubtitle.codec)
           ? null
           : pickedSubtitle;
@@ -614,6 +617,17 @@ export class FfmpegStreamFactory {
           'Skipping image-based subtitle %s (%s)',
           pickedSubtitle.index ?? pickedSubtitle.path,
           pickedSubtitle.codec,
+        );
+      }
+      if (
+        subtitleStream &&
+        AssCodecs.has(subtitleStream.codec.toLowerCase()) &&
+        this.featureFlagService.get('webvttSidecarEnabled')
+      ) {
+        subtitleStream = await this.dialogueSubtitle(
+          subtitleStream,
+          streamDetails,
+          lineupItem,
         );
       }
       selectedSubtitle = subtitleStream ?? undefined;
@@ -708,6 +722,58 @@ export class FfmpegStreamFactory {
       selectedAudio,
       selectedSubtitle,
     };
+  }
+
+  /**
+   * The sidecar shows dialogue only. Fansub releases often carry a "Signs &
+   * Songs" ASS track next to the full one, with nothing to tell them apart
+   * (no titles in the library), so of the ASS tracks in the selected language
+   * use the one with the most dialogue, cleaned of typesetting. None with any
+   * dialogue: no subtitles.
+   */
+  private async dialogueSubtitle(
+    picked: SubtitleStreamDetails,
+    streamDetails: StreamDetails,
+    lineupItem: ContentBackedStreamLineupItem,
+  ): Promise<SubtitleStreamDetails | null> {
+    const language = picked.languageCodeISO6392 ?? picked.language;
+    const candidates = [
+      picked,
+      ...(streamDetails.subtitleDetails ?? []).filter(
+        (s) =>
+          s.index !== picked.index &&
+          AssCodecs.has(s.codec.toLowerCase()) &&
+          (s.languageCodeISO6392 ?? s.language) === language,
+      ),
+    ];
+    let best:
+      | { stream: SubtitleStreamDetails; path: string; lines: number }
+      | undefined;
+    for (const candidate of candidates) {
+      const sourcePath =
+        candidate.path ??
+        (
+          await SubtitleStreamPicker.getSubtitleDetailsWithExtractedPath(
+            lineupItem,
+            candidate,
+          )
+        )?.path;
+      if (!sourcePath || isHttpUrl(sourcePath)) continue;
+      try {
+        const { path, dialogueLines } = await dialogueAssFile(sourcePath);
+        if (!best || dialogueLines > best.lines) {
+          best = { stream: candidate, path, lines: dialogueLines };
+        }
+      } catch (e) {
+        this.logger.debug(e, 'Could not read subtitle file %s', sourcePath);
+      }
+    }
+    if (!best) return picked;
+    if (best.lines === 0) {
+      this.logger.debug('No dialogue in any %s subtitle track', language);
+      return null;
+    }
+    return { ...best.stream, type: 'external', path: best.path };
   }
 
   /**
