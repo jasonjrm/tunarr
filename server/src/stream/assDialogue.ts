@@ -68,7 +68,10 @@ export async function dialogueAssFile(
   const known = counts.get(out);
   if (known !== undefined) {
     try {
-      await fs.access(out);
+      // Fresh mtime on every use, so the subtitle cache sweep (which removes
+      // unreferenced files past an age) never deletes one about to be read.
+      const now = new Date();
+      await fs.utimes(out, now, now);
       return { path: out, dialogueLines: known };
     } catch {
       counts.delete(out);
@@ -76,7 +79,16 @@ export async function dialogueAssFile(
   }
   const source = await fs.readFile(path, 'utf-8');
   const { content, dialogueLines } = dialogueOnlyAss(source.replace(/^﻿/, ''));
-  await fs.writeFile(out, content);
+  // Written aside and renamed into place: two sessions may build the same
+  // file at once, and ffmpeg must never read a half-written one.
+  const tmp = `${out}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await fs.writeFile(tmp, content);
+    await fs.rename(tmp, out);
+  } catch (e) {
+    await fs.rm(tmp, { force: true });
+    throw e;
+  }
   counts.set(out, dialogueLines);
   return { path: out, dialogueLines };
 }

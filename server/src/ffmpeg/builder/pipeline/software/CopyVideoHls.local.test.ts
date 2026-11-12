@@ -496,6 +496,39 @@ describe.skipIf(!binaries)('copy video + AAC audio to HLS', () => {
   );
 
   ffmpegTest(
+    'keyframeAtOrBefore is relative to the file start, like ffmpeg -ss (MPEG-TS starting at 10 s)',
+    async ({ ffmpegInfo }) => {
+      const ts = path.join(workdir, 'offset_start.ts');
+      const made = spawnSync(binaries!.ffmpeg, [
+        '-y',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc=size=640x360:rate=30',
+        '-t',
+        '15',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-force_key_frames',
+        'expr:gte(t,n_forced*5)',
+        '-sc_threshold',
+        '0',
+        '-an',
+        '-output_ts_offset',
+        '10',
+        ts,
+      ]);
+      expect(made.status, made.stderr?.toString()).toBe(0);
+      // Keyframes every 5 s of content: a seek to 7 s lands on the 5 s one.
+      const k = await ffmpegInfo.keyframeAtOrBefore(ts, dayjs.duration(7000));
+      expect(k).toBeDefined();
+      expect(Math.abs(k!.asMilliseconds() - 5000)).toBeLessThan(100);
+    },
+  );
+
+  ffmpegTest(
     'sidecar subtitles start at the copied video keyframe after a mid-program tune-in',
     async ({ binaryCapabilities, ffmpegVersion, ffmpegInfo }) => {
       // 15 s source, keyframes at 0 s and 10 s; one cue at 10.0 s.

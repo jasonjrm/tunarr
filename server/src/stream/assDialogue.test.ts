@@ -109,7 +109,18 @@ describe('dialogueAssFile', () => {
       const written = await fs.readFile(first.path, 'utf-8');
       expect(written.startsWith('[Script Info]')).toBe(true);
       expect(written).not.toContain('SIGN');
+      // Reuse refreshes the mtime, so the cache sweep never removes it in use.
+      const old = new Date(Date.now() - 86_400_000);
+      await fs.utimes(first.path, old, old);
       expect(await dialogueAssFile(source)).toEqual(first);
+      expect((await fs.stat(first.path)).mtimeMs).toBeGreaterThan(
+        old.getTime() + 60_000,
+      );
+      // Written aside and renamed: no temp files left behind.
+      expect((await fs.readdir(dir)).sort()).toEqual([
+        'track.ass',
+        'track.ass.dialogue.ass',
+      ]);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

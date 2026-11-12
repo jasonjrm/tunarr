@@ -607,7 +607,14 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   }
 
   protected override getAdditionalRequiredFiles(): string[] {
-    return this.#currentSubtitleRendition
+    // Transcoded HLS serves a subtitle playlist built from the video playlist
+    // (alignedSubtitlePlaylist), so it never waits for ffmpeg's own subs.m3u8.
+    // ffmpeg's segment muxer writes that file only once the first cue arrives,
+    // so waiting for it failed the start whenever the next line of dialogue
+    // was more than the 15 s start timeout away (an opening song, a quiet
+    // scene). hls_direct_v2 does serve ffmpeg's file.
+    return this.#currentSubtitleRendition &&
+      this.sessionOptions.streamMode === 'hls_direct_v2'
       ? [this.getHlsOptions().subtitleStreamNameFormat]
       : [];
   }

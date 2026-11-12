@@ -370,6 +370,28 @@ export class FfmpegInfo {
     timeoutMs = 5000,
   ): Promise<Duration | undefined> {
     try {
+      // ffmpeg's -ss is relative to the file's start time; ffprobe's
+      // -read_intervals is an absolute timestamp. Files that don't start at 0
+      // (MPEG-TS recordings) need the start time added first.
+      const startOutput = await this.getFfprobeStdout(
+        [
+          '-v',
+          'error',
+          '-show_entries',
+          'format=start_time',
+          '-print_format',
+          'json',
+          path,
+        ],
+        { timeout: timeoutMs, swallowError: false },
+      );
+      const fileStart = Number(
+        (JSON.parse(startOutput) as { format?: { start_time?: string } }).format
+          ?.start_time ?? 0,
+      );
+      if (!Number.isFinite(fileStart)) {
+        return undefined;
+      }
       const output = await this.getFfprobeStdout(
         [
           '-v',
@@ -378,10 +400,13 @@ export class FfmpegInfo {
           'v:0',
           '-skip_frame',
           'nokey',
+          // Every keyframe in the 20 s before the seek point; the last one is
+          // where the seek lands. (Reading one packet after a seek only works
+          // in containers with a keyframe index, not in MPEG-TS.)
           '-read_intervals',
-          `${start.asSeconds()}%+#1`,
+          `${Math.max(0, fileStart + start.asSeconds() - 20)}%${fileStart + start.asSeconds()}`,
           '-show_entries',
-          'frame=pts_time:format=start_time',
+          'frame=pts_time',
           '-print_format',
           'json',
           path,
@@ -390,13 +415,15 @@ export class FfmpegInfo {
       );
       const parsed = JSON.parse(output) as {
         frames?: { pts_time?: string }[];
-        format?: { start_time?: string };
       };
-      const pts = Number(parsed.frames?.[0]?.pts_time);
-      const fileStart = Number(parsed.format?.start_time ?? 0);
-      if (!Number.isFinite(pts) || !Number.isFinite(fileStart)) {
+      const target = fileStart + start.asSeconds();
+      const keyframes = (parsed.frames ?? [])
+        .map((f) => Number(f.pts_time))
+        .filter((t) => Number.isFinite(t) && t <= target + 0.001);
+      if (keyframes.length === 0) {
         return undefined;
       }
+      const pts = Math.max(...keyframes);
       const relativeMs = Math.round((pts - fileStart) * 1000);
       // ffmpeg can only land at or before the request; anything else is noise.
       if (relativeMs < 0 || relativeMs > start.asMilliseconds()) {

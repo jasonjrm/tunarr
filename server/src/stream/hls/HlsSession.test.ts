@@ -646,6 +646,93 @@ describe('HlsSession', () => {
   });
 });
 
+describe('required files at start (subtitle sidecar)', () => {
+  let tmpDir: tmp.DirResult;
+  beforeEach(() => {
+    tmpDir = tmp.dirSync({ unsafeCleanup: true });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    tmpDir.removeCallback();
+  });
+
+  async function requiredFiles(streamMode: HlsSessionOptions['streamMode']) {
+    vi.spyOn(MeasureAudioEncoderLeadTask.prototype, 'run').mockResolvedValue(
+      Result.success(0),
+    );
+    let session: HlsSession;
+    const programStream = {
+      on: vi.fn(),
+      setup: vi.fn(() =>
+        Promise.resolve(Result.success(programStream.transcodeSession)),
+      ),
+      start: vi.fn(() => Promise.resolve()),
+      renditions: {
+        audio: [],
+        subtitle: { language: 'eng', default: false, forced: false },
+      },
+      copiedVideo: false,
+      transcodeSession: {
+        streamDuration: dayjs.duration(50, 'seconds'),
+        kill: vi.fn(),
+        wait: vi.fn(async () => {
+          await session.stop({ waitForExit: false });
+          return { code: 0, signal: null };
+        }),
+        exited: Promise.resolve(),
+      },
+    };
+    session = new HlsSession(
+      {
+        uuid: channelUuid,
+        transcodeConfig: {},
+      } as ChannelOrmWithTranscodeConfig,
+      { streamMode, initialSegmentCount: 2, transcodeDirectory: tmpDir.name },
+      {
+        getCurrentLineupItem: vi.fn(() =>
+          Promise.resolve(
+            Result.success({
+              lineupItem: {
+                type: 'program',
+                streamDuration: 50_000,
+                duration: 50_000,
+                program: { uuid: 'p' },
+              },
+              channelContext: {},
+              sourceChannel: {},
+            }),
+          ),
+        ),
+      } as unknown as StreamProgramCalculator,
+      {} as ISettingsDB,
+      {
+        getLiveTimestamp: vi.fn((_id: string, ts: number) =>
+          Promise.resolve(ts),
+        ),
+      } as unknown as OnDemandChannelService,
+      (() => programStream as unknown as ProgramStream) as (
+        ctx: PlayerContext,
+        fmt: OutputFormat,
+      ) => ProgramStream,
+    );
+    await (
+      session as unknown as { startInternal(): Promise<void> }
+    ).startInternal();
+    await vi.waitFor(() => expect(programStream.start).toHaveBeenCalled());
+    return (
+      session as unknown as { getAdditionalRequiredFiles(): string[] }
+    ).getAdditionalRequiredFiles();
+  }
+
+  test("transcoded HLS never waits for ffmpeg's subs.m3u8 (written only at the first cue)", async () => {
+    expect(await requiredFiles('hls')).toEqual([]);
+  });
+
+  test('hls_direct_v2 still waits for it (it serves that file)', async () => {
+    expect(await requiredFiles('hls_direct_v2')).toEqual(['subs.m3u8']);
+  });
+});
+
 describe('copied-video fallback (CT-4)', () => {
   let tmpDir: tmp.DirResult;
   const savedEnv = process.env.TUNARR_COPY_VIDEO_CHANNELS;
