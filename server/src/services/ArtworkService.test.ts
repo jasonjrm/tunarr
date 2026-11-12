@@ -1,12 +1,20 @@
 import { tag } from '@tunarr/types';
 import axios from 'axios';
 import type { FastifyReply } from 'fastify';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { anything, instance, mock, when } from 'ts-mockito';
 import { v4 } from 'uuid';
-import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from 'vitest';
 import type { IProgramDB } from '../db/interfaces/IProgramDB.ts';
 import type { MediaSourceDB } from '../db/mediaSourceDB.ts';
 import type { Artwork } from '../db/schema/Artwork.ts';
@@ -233,6 +241,8 @@ describe('ArtworkService stored artwork fallback', () => {
 });
 
 const artworkCacheDir = mkdtempSync(join(tmpdir(), 'tunarr-artwork-'));
+// Removed after the file runs; every test run used to leave one in /tmp.
+afterAll(() => rmSync(artworkCacheDir, { recursive: true, force: true }));
 
 describe('ArtworkService cached artwork files', () => {
   function serviceWithCache(cacheFilePath: string, sourcePath: string) {
